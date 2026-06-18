@@ -27,6 +27,13 @@ _SPREADSHEET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,100}$")
 _RENDER_OPTIONS = {"FORMATTED_VALUE", "UNFORMATTED_VALUE", "FORMULA"}
 _INPUT_OPTIONS = {"USER_ENTERED", "RAW"}
 
+# Functions that make outbound HTTP requests when evaluated by Sheets.
+# Blocked inside CUSTOM_FORMULA conditions to prevent data exfiltration.
+_NETWORK_FORMULA_RE = re.compile(
+    r"\b(IMPORTDATA|IMPORTRANGE|IMPORTHTML|IMPORTFEED|IMPORTXML|IMAGE)\s*\(",
+    re.IGNORECASE,
+)
+
 
 def _sid(spreadsheet_id: str) -> str:
     """Validate and return a spreadsheet ID."""
@@ -212,17 +219,14 @@ def write_range(
     spreadsheet_id: str,
     range: str,
     values: list[list[Any]],
-    value_input_option: str = "USER_ENTERED",
+    value_input_option: str = "RAW",
 ) -> dict:
     """Write a 2D array of values to an A1 range.
 
-    ``value_input_option``: ``USER_ENTERED`` (parse like a user typing — formulas,
-    dates, and numbers are interpreted; default) or ``RAW`` (store verbatim as
-    strings). The range's top-left anchors the write.
-
-    **Note:** ``USER_ENTERED`` evaluates formulas, including those that make
-    external network requests (e.g. ``=IMPORTDATA(...)``). Use ``RAW`` if you
-    are writing untrusted user-supplied content.
+    ``value_input_option``: ``RAW`` (store verbatim as strings; default) or
+    ``USER_ENTERED`` (parse like a user typing — formulas, dates, and numbers
+    are evaluated). Opt in to ``USER_ENTERED`` explicitly; it evaluates formulas
+    including those that can make external network requests.
     """
     result = _api(
         client.spreadsheets.values().update,
@@ -244,16 +248,15 @@ def append_rows(
     spreadsheet_id: str,
     range: str,
     values: list[list[Any]],
-    value_input_option: str = "USER_ENTERED",
+    value_input_option: str = "RAW",
 ) -> dict:
     """Append rows after the last row of data within/near the given A1 range.
 
     The ``range`` selects the table to append to (e.g. ``Sheet1!A1`` or
     ``Sheet1!A:D``); new rows are added below the existing data.
 
-    **Note:** ``USER_ENTERED`` evaluates formulas, including those that make
-    external network requests (e.g. ``=IMPORTDATA(...)``). Use ``RAW`` if you
-    are writing untrusted user-supplied content.
+    ``value_input_option``: ``RAW`` (verbatim strings; default) or
+    ``USER_ENTERED`` (evaluate formulas/dates/numbers — opt in explicitly).
     """
     result = _api(
         client.spreadsheets.values().append,
@@ -570,7 +573,17 @@ def add_conditional_format(
     if not fmt:
         raise ValueError("Provide at least one of background_color, text_color, bold.")
 
-    condition: dict[str, Any] = {"type": condition_type.upper()}
+    ctype = condition_type.upper()
+    if ctype == "CUSTOM_FORMULA" and values:
+        for v in values:
+            if _NETWORK_FORMULA_RE.search(v):
+                raise ValueError(
+                    f"CUSTOM_FORMULA value contains a network-fetching function "
+                    f"({_NETWORK_FORMULA_RE.search(v).group(1)}), which is not "
+                    "allowed. Use a formula that does not make external requests."
+                )
+
+    condition: dict[str, Any] = {"type": ctype}
     if values:
         condition["values"] = [{"userEnteredValue": v} for v in values]
 
