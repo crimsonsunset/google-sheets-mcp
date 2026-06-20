@@ -24,6 +24,10 @@ API v4. Runs over stdio, authenticates with your own Google account via OAuth.
 - `add_conditional_format` — boolean rules (number/text/custom-formula conditions)
 - `batch_update` — raw Sheets API `batchUpdate` escape hatch for anything else
 
+**Charts**
+- `create_chart` — create embedded column, bar, line, area, scatter, combo,
+  stepped-area, pie, and donut charts from existing row/column ranges
+
 ## Setup
 
 ### 1. Get an OAuth client secret

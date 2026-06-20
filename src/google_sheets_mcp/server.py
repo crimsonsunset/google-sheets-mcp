@@ -26,6 +26,17 @@ client = SheetsClient()
 _SPREADSHEET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,100}$")
 _RENDER_OPTIONS = {"FORMATTED_VALUE", "UNFORMATTED_VALUE", "FORMULA"}
 _INPUT_OPTIONS = {"USER_ENTERED", "RAW"}
+_BASIC_CHART_TYPES = {"BAR", "LINE", "AREA", "COLUMN", "SCATTER", "COMBO", "STEPPED_AREA"}
+_PIE_CHART_TYPES = {"PIE", "DONUT"}
+_BASIC_LEGEND_POSITIONS = {
+    "BOTTOM_LEGEND",
+    "LEFT_LEGEND",
+    "RIGHT_LEGEND",
+    "TOP_LEGEND",
+    "NO_LEGEND",
+}
+_PIE_LEGEND_POSITIONS = _BASIC_LEGEND_POSITIONS | {"LABELED_LEGEND"}
+_STACKED_TYPES = {"NOT_STACKED", "STACKED", "PERCENT_STACKED"}
 
 # Functions that make outbound HTTP requests when evaluated by Sheets.
 # Blocked inside CUSTOM_FORMULA conditions to prevent data exfiltration.
@@ -73,6 +84,165 @@ def _api(fn, *args, **kwargs):
         raise RuntimeError(
             f"Google Sheets API error {exc.status_code}: {exc.reason}"
         ) from None
+
+
+def _grid_span(grid: dict[str, int], start_key: str, end_key: str) -> int | None:
+    if start_key not in grid or end_key not in grid:
+        return None
+    return grid[end_key] - grid[start_key]
+
+
+def _validate_chart_source_grid(range_a1: str, grid: dict[str, int]) -> None:
+    """Validate that a source range is suitable for a Sheets chart series/domain."""
+    row_span = _grid_span(grid, "startRowIndex", "endRowIndex")
+    col_span = _grid_span(grid, "startColumnIndex", "endColumnIndex")
+    if row_span is None and col_span is None:
+        raise ValueError(f"Chart source range {range_a1!r} must identify cells, not a whole sheet.")
+    if row_span is not None and row_span <= 0:
+        raise ValueError(f"Chart source range {range_a1!r} has no rows.")
+    if col_span is not None and col_span <= 0:
+        raise ValueError(f"Chart source range {range_a1!r} has no columns.")
+    if row_span != 1 and col_span != 1:
+        raise ValueError(
+            f"Chart source range {range_a1!r} must be a single row or single column "
+            "(for example, Sheet1!A2:A10 or Sheet1!B1:F1)."
+        )
+
+
+def _anchor_coordinate(sheet_id: int, anchor_cell: str) -> dict[str, int]:
+    sheet_name, cell_ref = split_sheet_and_range(anchor_cell)
+    if sheet_name is not None:
+        raise ValueError("anchor_cell must be a sheet-relative single cell like 'E2'; use sheet to choose the tab.")
+
+    grid = a1_to_grid_range(cell_ref)
+    if (
+        "startRowIndex" not in grid
+        or "startColumnIndex" not in grid
+        or grid.get("endRowIndex") != grid["startRowIndex"] + 1
+        or grid.get("endColumnIndex") != grid["startColumnIndex"] + 1
+    ):
+        raise ValueError("anchor_cell must be a single cell like 'E2'.")
+
+    return {
+        "sheetId": sheet_id,
+        "rowIndex": grid["startRowIndex"],
+        "columnIndex": grid["startColumnIndex"],
+    }
+
+
+def _chart_data(grid: dict[str, int]) -> dict:
+    return {"sourceRange": {"sources": [grid]}}
+
+
+def _normalize_chart_type(chart_type: str) -> str:
+    ctype = chart_type.upper()
+    if ctype not in _BASIC_CHART_TYPES and ctype not in _PIE_CHART_TYPES:
+        allowed = ", ".join(sorted(_BASIC_CHART_TYPES | _PIE_CHART_TYPES))
+        raise ValueError(f"Invalid chart_type {chart_type!r}. Choose from: {allowed}.")
+    return ctype
+
+
+def _build_add_chart_request(
+    *,
+    chart_type: str,
+    domain_grid: dict[str, int],
+    series_grids: list[dict[str, int]],
+    position_sheet_id: int,
+    anchor_cell: str,
+    title: str | None = None,
+    legend_position: str = "RIGHT_LEGEND",
+    x_axis_title: str | None = None,
+    y_axis_title: str | None = None,
+    header_count: int | None = None,
+    stacked_type: str | None = None,
+    width_pixels: int = 600,
+    height_pixels: int = 371,
+    offset_x_pixels: int = 0,
+    offset_y_pixels: int = 0,
+    pie_hole: float | None = None,
+    three_dimensional: bool = False,
+) -> dict:
+    """Build a Sheets API ``addChart`` request from already-resolved grid ranges."""
+    ctype = _normalize_chart_type(chart_type)
+    if not series_grids:
+        raise ValueError("Provide at least one series range.")
+    if width_pixels <= 0 or height_pixels <= 0:
+        raise ValueError("width_pixels and height_pixels must be positive.")
+    if header_count is not None and header_count < 0:
+        raise ValueError("header_count must be >= 0.")
+    if pie_hole is not None and not 0 <= pie_hole <= 1:
+        raise ValueError("pie_hole must be between 0 and 1.")
+
+    legend = legend_position.upper()
+    spec: dict[str, Any] = {}
+    if title:
+        spec["title"] = title
+
+    if ctype in _PIE_CHART_TYPES:
+        if len(series_grids) != 1:
+            raise ValueError("PIE and DONUT charts require exactly one series range.")
+        if legend not in _PIE_LEGEND_POSITIONS:
+            allowed = ", ".join(sorted(_PIE_LEGEND_POSITIONS))
+            raise ValueError(f"Invalid pie legend_position {legend_position!r}. Choose from: {allowed}.")
+        pie_spec: dict[str, Any] = {
+            "domain": _chart_data(domain_grid),
+            "series": _chart_data(series_grids[0]),
+            "legendPosition": legend,
+        }
+        if ctype == "DONUT":
+            pie_spec["pieHole"] = 0.4 if pie_hole is None else pie_hole
+        elif pie_hole is not None:
+            pie_spec["pieHole"] = pie_hole
+        if three_dimensional:
+            pie_spec["threeDimensional"] = True
+        spec["pieChart"] = pie_spec
+    else:
+        if legend not in _BASIC_LEGEND_POSITIONS:
+            allowed = ", ".join(sorted(_BASIC_LEGEND_POSITIONS))
+            raise ValueError(f"Invalid legend_position {legend_position!r}. Choose from: {allowed}.")
+        basic_spec: dict[str, Any] = {
+            "chartType": ctype,
+            "legendPosition": legend,
+            "domains": [{"domain": _chart_data(domain_grid)}],
+            "series": [
+                {"series": _chart_data(grid), "targetAxis": "LEFT_AXIS"}
+                for grid in series_grids
+            ],
+        }
+        if header_count is not None:
+            basic_spec["headerCount"] = header_count
+        if stacked_type is not None:
+            stacked = stacked_type.upper()
+            if stacked not in _STACKED_TYPES:
+                allowed = ", ".join(sorted(_STACKED_TYPES))
+                raise ValueError(f"Invalid stacked_type {stacked_type!r}. Choose from: {allowed}.")
+            basic_spec["stackedType"] = stacked
+
+        axes = []
+        if x_axis_title:
+            axes.append({"position": "BOTTOM_AXIS", "title": x_axis_title})
+        if y_axis_title:
+            axes.append({"position": "LEFT_AXIS", "title": y_axis_title})
+        if axes:
+            basic_spec["axis"] = axes
+        spec["basicChart"] = basic_spec
+
+    return {
+        "addChart": {
+            "chart": {
+                "spec": spec,
+                "position": {
+                    "overlayPosition": {
+                        "anchorCell": _anchor_coordinate(position_sheet_id, anchor_cell),
+                        "offsetXPixels": offset_x_pixels,
+                        "offsetYPixels": offset_y_pixels,
+                        "widthPixels": width_pixels,
+                        "heightPixels": height_pixels,
+                    }
+                },
+            }
+        }
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +702,82 @@ def freeze(
     }
     client.batch_update(spreadsheet_id, [req])
     return {"sheetId": sheet_id, "frozenRows": rows, "frozenColumns": columns}
+
+
+# ---------------------------------------------------------------------------
+# Charts
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def create_chart(
+    spreadsheet_id: str,
+    sheet: str,
+    chart_type: str,
+    domain_range: str,
+    series_ranges: list[str],
+    title: str | None = None,
+    anchor_cell: str = "E2",
+    legend_position: str = "RIGHT_LEGEND",
+    x_axis_title: str | None = None,
+    y_axis_title: str | None = None,
+    header_count: int | None = None,
+    stacked_type: str | None = None,
+    width_pixels: int = 600,
+    height_pixels: int = 371,
+    offset_x_pixels: int = 0,
+    offset_y_pixels: int = 0,
+    pie_hole: float | None = None,
+    three_dimensional: bool = False,
+) -> dict:
+    """Create an embedded chart from existing sheet data.
+
+    ``chart_type``: ``COLUMN``, ``BAR``, ``LINE``, ``AREA``, ``SCATTER``,
+    ``COMBO``, ``STEPPED_AREA``, ``PIE``, or ``DONUT``.
+
+    ``domain_range`` is the category/label range; ``series_ranges`` is one or
+    more value ranges. Each source must be a single row or single column, e.g.
+    ``Sheet1!A2:A10`` plus ``Sheet1!B2:B10``. Ranges without a sheet prefix use
+    ``sheet``. ``anchor_cell`` is where the chart is overlaid on that sheet.
+    """
+    sid = _sid(spreadsheet_id)
+    position_sheet_id = client.resolve_sheet_id(sid, sheet)
+
+    domain_grid = client.resolve_grid_range(sid, domain_range, default_sheet=sheet)
+    _validate_chart_source_grid(domain_range, domain_grid)
+    series_grids = []
+    for range_a1 in series_ranges:
+        grid = client.resolve_grid_range(sid, range_a1, default_sheet=sheet)
+        _validate_chart_source_grid(range_a1, grid)
+        series_grids.append(grid)
+
+    req = _build_add_chart_request(
+        chart_type=chart_type,
+        domain_grid=domain_grid,
+        series_grids=series_grids,
+        position_sheet_id=position_sheet_id,
+        anchor_cell=anchor_cell,
+        title=title,
+        legend_position=legend_position,
+        x_axis_title=x_axis_title,
+        y_axis_title=y_axis_title,
+        header_count=header_count,
+        stacked_type=stacked_type,
+        width_pixels=width_pixels,
+        height_pixels=height_pixels,
+        offset_x_pixels=offset_x_pixels,
+        offset_y_pixels=offset_y_pixels,
+        pie_hole=pie_hole,
+        three_dimensional=three_dimensional,
+    )
+    result = client.batch_update(sid, [req])
+    chart = result.get("replies", [{}])[0].get("addChart", {}).get("chart", {})
+    return {
+        "chartId": chart.get("chartId"),
+        "sheetId": position_sheet_id,
+        "title": title,
+        "chartType": _normalize_chart_type(chart_type),
+    }
 
 
 # ---------------------------------------------------------------------------
