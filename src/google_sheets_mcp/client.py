@@ -39,8 +39,15 @@ class SheetsClient:
             spreadsheetId=spreadsheet_id,
             fields=(
                 "spreadsheetId,properties.title,spreadsheetUrl,"
-                "sheets.properties(sheetId,title,index,sheetType,"
-                "gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount))"
+                "namedRanges(namedRangeId,name,range),"
+                "sheets(properties(sheetId,title,index,sheetType,"
+                "gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount)),"
+                "charts(chartId,spec.title,position),"
+                "filterViews(filterViewId,title,range),"
+                "protectedRanges(protectedRangeId,description,range,warningOnly),"
+                "bandedRanges(bandedRangeId,range),"
+                "slicers(slicerId,spec.title,position),"
+                "tables(tableId,name,range))"
             ),
         ).execute()
 

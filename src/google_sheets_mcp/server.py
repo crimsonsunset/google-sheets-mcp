@@ -37,6 +37,80 @@ _BASIC_LEGEND_POSITIONS = {
 }
 _PIE_LEGEND_POSITIONS = _BASIC_LEGEND_POSITIONS | {"LABELED_LEGEND"}
 _STACKED_TYPES = {"NOT_STACKED", "STACKED", "PERCENT_STACKED"}
+_ADVANCED_BATCH_MAX_REQUESTS = 50
+_BLOCKED_BATCH_REQUEST_KINDS = {
+    "addDataSource",
+    "updateDataSource",
+    "deleteDataSource",
+    "refreshDataSource",
+    "cancelDataSourceRefresh",
+}
+_ALLOWED_BATCH_REQUEST_KINDS = {
+    "updateSpreadsheetProperties",
+    "updateSheetProperties",
+    "updateDimensionProperties",
+    "updateNamedRange",
+    "repeatCell",
+    "addNamedRange",
+    "deleteNamedRange",
+    "addSheet",
+    "deleteSheet",
+    "autoFill",
+    "cutPaste",
+    "copyPaste",
+    "mergeCells",
+    "unmergeCells",
+    "updateBorders",
+    "updateCells",
+    "addFilterView",
+    "appendCells",
+    "clearBasicFilter",
+    "deleteDimension",
+    "deleteEmbeddedObject",
+    "deleteFilterView",
+    "duplicateFilterView",
+    "duplicateSheet",
+    "findReplace",
+    "insertDimension",
+    "insertRange",
+    "moveDimension",
+    "updateEmbeddedObjectPosition",
+    "pasteData",
+    "textToColumns",
+    "updateFilterView",
+    "deleteRange",
+    "appendDimension",
+    "addConditionalFormatRule",
+    "updateConditionalFormatRule",
+    "deleteConditionalFormatRule",
+    "sortRange",
+    "setDataValidation",
+    "setBasicFilter",
+    "addProtectedRange",
+    "updateProtectedRange",
+    "deleteProtectedRange",
+    "autoResizeDimensions",
+    "addChart",
+    "updateChartSpec",
+    "updateBanding",
+    "addBanding",
+    "deleteBanding",
+    "createDeveloperMetadata",
+    "updateDeveloperMetadata",
+    "deleteDeveloperMetadata",
+    "randomizeRange",
+    "addDimensionGroup",
+    "deleteDimensionGroup",
+    "updateDimensionGroup",
+    "trimWhitespace",
+    "deleteDuplicates",
+    "updateEmbeddedObjectBorder",
+    "addSlicer",
+    "updateSlicerSpec",
+    "addTable",
+    "updateTable",
+    "deleteTable",
+}
 
 # Functions that make outbound HTTP requests when evaluated by Sheets.
 # Blocked inside CUSTOM_FORMULA conditions to prevent data exfiltration.
@@ -84,6 +158,138 @@ def _api(fn, *args, **kwargs):
         raise RuntimeError(
             f"Google Sheets API error {exc.status_code}: {exc.reason}"
         ) from None
+
+
+def _request_kind(req: dict) -> str:
+    if not isinstance(req, dict):
+        raise ValueError("Each batchUpdate request must be an object.")
+    kinds = [k for k, v in req.items() if v is not None]
+    if len(kinds) != 1:
+        raise ValueError(
+            "Each batchUpdate request must specify exactly one request kind "
+            f"(got {len(kinds)}: {', '.join(kinds) or 'none'})."
+        )
+    kind = kinds[0]
+    if kind in _BLOCKED_BATCH_REQUEST_KINDS:
+        raise ValueError(f"Request kind {kind!r} is blocked by this MCP server.")
+    if kind not in _ALLOWED_BATCH_REQUEST_KINDS:
+        allowed = ", ".join(sorted(_ALLOWED_BATCH_REQUEST_KINDS))
+        raise ValueError(f"Request kind {kind!r} is not allowed. Allowed kinds: {allowed}.")
+    return kind
+
+
+def _validate_advanced_requests(requests: list[dict]) -> list[str]:
+    if not requests:
+        raise ValueError("Provide at least one request.")
+    if len(requests) > _ADVANCED_BATCH_MAX_REQUESTS:
+        raise ValueError(
+            f"Too many requests: {len(requests)}. Maximum is {_ADVANCED_BATCH_MAX_REQUESTS}."
+        )
+    return [_request_kind(req) for req in requests]
+
+
+def _execute_batch_update(
+    spreadsheet_id: str,
+    requests: list[dict],
+    response_ranges: list[str] | None = None,
+    include_spreadsheet_in_response: bool = False,
+) -> dict:
+    body: dict[str, Any] = {
+        "requests": requests,
+        "includeSpreadsheetInResponse": include_spreadsheet_in_response,
+    }
+    if response_ranges:
+        body["responseRanges"] = response_ranges
+    return _api(
+        client.spreadsheets.batchUpdate,
+        spreadsheetId=_sid(spreadsheet_id),
+        body=body,
+    )
+
+
+def _dimension(dimension: str) -> str:
+    upper = dimension.upper()
+    if upper not in {"ROWS", "COLUMNS"}:
+        raise ValueError("dimension must be ROWS or COLUMNS.")
+    return upper
+
+
+def _dimension_range(
+    spreadsheet_id: str,
+    sheet: str,
+    dimension: str,
+    start_index: int,
+    end_index: int,
+) -> dict:
+    if start_index < 0 or end_index <= start_index:
+        raise ValueError("Dimension indices must be zero-based and end_index must be greater than start_index.")
+    return {
+        "sheetId": client.resolve_sheet_id(_sid(spreadsheet_id), sheet),
+        "dimension": _dimension(dimension),
+        "startIndex": start_index,
+        "endIndex": end_index,
+    }
+
+
+def _single_cell_coordinate(spreadsheet_id: str, cell: str, default_sheet: str | int | None = None) -> dict:
+    grid = client.resolve_grid_range(_sid(spreadsheet_id), cell, default_sheet=default_sheet)
+    if (
+        "startRowIndex" not in grid
+        or "startColumnIndex" not in grid
+        or grid.get("endRowIndex") != grid["startRowIndex"] + 1
+        or grid.get("endColumnIndex") != grid["startColumnIndex"] + 1
+    ):
+        raise ValueError("Expected a single cell reference like 'A1' or 'Sheet1!A1'.")
+    return {
+        "sheetId": grid["sheetId"],
+        "rowIndex": grid["startRowIndex"],
+        "columnIndex": grid["startColumnIndex"],
+    }
+
+
+def _overlay_position(
+    spreadsheet_id: str,
+    sheet: str,
+    anchor_cell: str,
+    width_pixels: int = 600,
+    height_pixels: int = 371,
+    offset_x_pixels: int = 0,
+    offset_y_pixels: int = 0,
+) -> dict:
+    sheet_id = client.resolve_sheet_id(_sid(spreadsheet_id), sheet)
+    if width_pixels <= 0 or height_pixels <= 0:
+        raise ValueError("width_pixels and height_pixels must be positive.")
+    return {
+        "overlayPosition": {
+            "anchorCell": _anchor_coordinate(sheet_id, anchor_cell),
+            "offsetXPixels": offset_x_pixels,
+            "offsetYPixels": offset_y_pixels,
+            "widthPixels": width_pixels,
+            "heightPixels": height_pixels,
+        }
+    }
+
+
+def _field_mask(fields: list[str] | None, default: str = "*") -> str:
+    if not fields:
+        return default
+    return ",".join(fields)
+
+
+def _condition(condition_type: str, values: list[str] | None = None) -> dict:
+    ctype = condition_type.upper()
+    if ctype == "CUSTOM_FORMULA" and values:
+        for v in values:
+            match = _NETWORK_FORMULA_RE.search(v)
+            if match:
+                raise ValueError(
+                    f"CUSTOM_FORMULA value contains a network-fetching function "
+                    f"({match.group(1)}), which is not allowed."
+                )
+    condition: dict[str, Any] = {"type": ctype}
+    if values:
+        condition["values"] = [{"userEnteredValue": v} for v in values]
+    return condition
 
 
 def _grid_span(grid: dict[str, int], start_key: str, end_key: str) -> int | None:
@@ -271,12 +477,53 @@ def get_spreadsheet_info(spreadsheet_id: str) -> dict:
                 "columnCount": grid.get("columnCount"),
                 "frozenRowCount": grid.get("frozenRowCount", 0),
                 "frozenColumnCount": grid.get("frozenColumnCount", 0),
+                "charts": [
+                    {
+                        "chartId": c.get("chartId"),
+                        "title": c.get("spec", {}).get("title"),
+                        "position": c.get("position"),
+                    }
+                    for c in s.get("charts", [])
+                ],
+                "filterViews": [
+                    {"filterViewId": f.get("filterViewId"), "title": f.get("title"), "range": f.get("range")}
+                    for f in s.get("filterViews", [])
+                ],
+                "protectedRanges": [
+                    {
+                        "protectedRangeId": pr.get("protectedRangeId"),
+                        "description": pr.get("description"),
+                        "warningOnly": pr.get("warningOnly"),
+                        "range": pr.get("range"),
+                    }
+                    for pr in s.get("protectedRanges", [])
+                ],
+                "bandedRanges": [
+                    {"bandedRangeId": br.get("bandedRangeId"), "range": br.get("range")}
+                    for br in s.get("bandedRanges", [])
+                ],
+                "slicers": [
+                    {
+                        "slicerId": sl.get("slicerId"),
+                        "title": sl.get("spec", {}).get("title"),
+                        "position": sl.get("position"),
+                    }
+                    for sl in s.get("slicers", [])
+                ],
+                "tables": [
+                    {"tableId": t.get("tableId"), "name": t.get("name"), "range": t.get("range")}
+                    for t in s.get("tables", [])
+                ],
             }
         )
     return {
         "spreadsheetId": meta.get("spreadsheetId"),
         "title": meta.get("properties", {}).get("title"),
         "url": meta.get("spreadsheetUrl"),
+        "namedRanges": [
+            {"namedRangeId": nr.get("namedRangeId"), "name": nr.get("name"), "range": nr.get("range")}
+            for nr in meta.get("namedRanges", [])
+        ],
         "sheets": sheets,
     }
 
@@ -335,6 +582,60 @@ def rename_sheet(spreadsheet_id: str, sheet: str, new_title: str) -> dict:
     }
     client.batch_update(spreadsheet_id, [req])
     return {"sheetId": sheet_id, "title": new_title}
+
+
+@mcp.tool()
+def delete_sheet(spreadsheet_id: str, sheet: str) -> dict:
+    """Delete a sheet/tab by name or numeric sheetId."""
+    sheet_id = client.resolve_sheet_id(_sid(spreadsheet_id), sheet)
+    _execute_batch_update(spreadsheet_id, [{"deleteSheet": {"sheetId": sheet_id}}])
+    return {"sheetId": sheet_id, "deleted": True}
+
+
+@mcp.tool()
+def duplicate_sheet(
+    spreadsheet_id: str,
+    sheet: str,
+    new_title: str | None = None,
+    insert_index: int | None = None,
+) -> dict:
+    """Duplicate a sheet/tab, optionally setting the new title and index."""
+    source_sheet_id = client.resolve_sheet_id(_sid(spreadsheet_id), sheet)
+    body: dict[str, Any] = {"sourceSheetId": source_sheet_id}
+    if new_title is not None:
+        body["newSheetName"] = new_title
+    if insert_index is not None:
+        body["insertSheetIndex"] = insert_index
+    result = _execute_batch_update(spreadsheet_id, [{"duplicateSheet": body}])
+    props = result.get("replies", [{}])[0].get("duplicateSheet", {}).get("properties", {})
+    return {
+        "sourceSheetId": source_sheet_id,
+        "sheetId": props.get("sheetId"),
+        "title": props.get("title", new_title),
+    }
+
+
+@mcp.tool()
+def batch_update_advanced(
+    spreadsheet_id: str,
+    requests: list[dict],
+    response_ranges: list[str] | None = None,
+    include_spreadsheet_in_response: bool = False,
+) -> dict:
+    """Run allowlisted raw Sheets API ``batchUpdate`` requests.
+
+    Each request must contain exactly one allowed request kind. Data-source
+    lifecycle requests are blocked, and a call may contain at most 50 requests.
+    Prefer the typed tools when one exists; use this for advanced API coverage.
+    """
+    kinds = _validate_advanced_requests(requests)
+    result = _execute_batch_update(
+        spreadsheet_id,
+        requests,
+        response_ranges=response_ranges,
+        include_spreadsheet_in_response=include_spreadsheet_in_response,
+    )
+    return {"requestKinds": kinds, "replies": result.get("replies", []), "spreadsheetId": result.get("spreadsheetId")}
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +755,41 @@ def clear_range(spreadsheet_id: str, range: str) -> dict:
         body={},
     )
     return {"clearedRange": result.get("clearedRange")}
+
+
+@mcp.tool()
+def batch_write(
+    spreadsheet_id: str,
+    data: list[dict],
+    value_input_option: str = "RAW",
+) -> dict:
+    """Write values to multiple ranges in one values ``batchUpdate`` call.
+
+    ``data`` items use the Sheets API ``ValueRange`` shape, e.g.
+    ``{"range": "Sheet1!A1:B2", "values": [[1, 2], [3, 4]]}``.
+    """
+    result = _api(
+        client.spreadsheets.values().batchUpdate,
+        spreadsheetId=_sid(spreadsheet_id),
+        body={"valueInputOption": _input_option(value_input_option), "data": data},
+    )
+    return {
+        "totalUpdatedRows": result.get("totalUpdatedRows"),
+        "totalUpdatedColumns": result.get("totalUpdatedColumns"),
+        "totalUpdatedCells": result.get("totalUpdatedCells"),
+        "responses": result.get("responses", []),
+    }
+
+
+@mcp.tool()
+def batch_clear(spreadsheet_id: str, ranges: list[str]) -> dict:
+    """Clear values from multiple A1 ranges in one call."""
+    result = _api(
+        client.spreadsheets.values().batchClear,
+        spreadsheetId=_sid(spreadsheet_id),
+        body={"ranges": ranges},
+    )
+    return {"clearedRanges": result.get("clearedRanges", [])}
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +1041,605 @@ def freeze(
 
 
 # ---------------------------------------------------------------------------
+# Sheet data operations
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def insert_rows(
+    spreadsheet_id: str,
+    sheet: str,
+    start_index: int,
+    end_index: int,
+    inherit_from_before: bool = False,
+) -> dict:
+    """Insert rows before ``start_index``; indices are zero-based and half-open."""
+    rng = _dimension_range(spreadsheet_id, sheet, "ROWS", start_index, end_index)
+    req = {"insertDimension": {"range": rng, "inheritFromBefore": inherit_from_before}}
+    _execute_batch_update(spreadsheet_id, [req])
+    return {"sheetId": rng["sheetId"], "dimension": "ROWS", "startIndex": start_index, "endIndex": end_index}
+
+
+@mcp.tool()
+def delete_rows(spreadsheet_id: str, sheet: str, start_index: int, end_index: int) -> dict:
+    """Delete rows; indices are zero-based and half-open."""
+    rng = _dimension_range(spreadsheet_id, sheet, "ROWS", start_index, end_index)
+    _execute_batch_update(spreadsheet_id, [{"deleteDimension": {"range": rng}}])
+    return {"sheetId": rng["sheetId"], "dimension": "ROWS", "startIndex": start_index, "endIndex": end_index}
+
+
+@mcp.tool()
+def insert_columns(
+    spreadsheet_id: str,
+    sheet: str,
+    start_index: int,
+    end_index: int,
+    inherit_from_before: bool = False,
+) -> dict:
+    """Insert columns before ``start_index``; indices are zero-based and half-open."""
+    rng = _dimension_range(spreadsheet_id, sheet, "COLUMNS", start_index, end_index)
+    req = {"insertDimension": {"range": rng, "inheritFromBefore": inherit_from_before}}
+    _execute_batch_update(spreadsheet_id, [req])
+    return {"sheetId": rng["sheetId"], "dimension": "COLUMNS", "startIndex": start_index, "endIndex": end_index}
+
+
+@mcp.tool()
+def delete_columns(spreadsheet_id: str, sheet: str, start_index: int, end_index: int) -> dict:
+    """Delete columns; indices are zero-based and half-open."""
+    rng = _dimension_range(spreadsheet_id, sheet, "COLUMNS", start_index, end_index)
+    _execute_batch_update(spreadsheet_id, [{"deleteDimension": {"range": rng}}])
+    return {"sheetId": rng["sheetId"], "dimension": "COLUMNS", "startIndex": start_index, "endIndex": end_index}
+
+
+@mcp.tool()
+def append_rows_to_sheet(spreadsheet_id: str, sheet: str, length: int) -> dict:
+    """Append empty rows to the end of a sheet."""
+    if length <= 0:
+        raise ValueError("length must be positive.")
+    sheet_id = client.resolve_sheet_id(_sid(spreadsheet_id), sheet)
+    _execute_batch_update(spreadsheet_id, [{"appendDimension": {"sheetId": sheet_id, "dimension": "ROWS", "length": length}}])
+    return {"sheetId": sheet_id, "dimension": "ROWS", "length": length}
+
+
+@mcp.tool()
+def append_columns_to_sheet(spreadsheet_id: str, sheet: str, length: int) -> dict:
+    """Append empty columns to the end of a sheet."""
+    if length <= 0:
+        raise ValueError("length must be positive.")
+    sheet_id = client.resolve_sheet_id(_sid(spreadsheet_id), sheet)
+    _execute_batch_update(spreadsheet_id, [{"appendDimension": {"sheetId": sheet_id, "dimension": "COLUMNS", "length": length}}])
+    return {"sheetId": sheet_id, "dimension": "COLUMNS", "length": length}
+
+
+@mcp.tool()
+def move_rows_or_columns(
+    spreadsheet_id: str,
+    sheet: str,
+    dimension: str,
+    start_index: int,
+    end_index: int,
+    destination_index: int,
+) -> dict:
+    """Move rows or columns to ``destination_index``; indices are zero-based."""
+    rng = _dimension_range(spreadsheet_id, sheet, dimension, start_index, end_index)
+    req = {"moveDimension": {"source": rng, "destinationIndex": destination_index}}
+    _execute_batch_update(spreadsheet_id, [req])
+    return {**rng, "destinationIndex": destination_index}
+
+
+@mcp.tool()
+def insert_range(spreadsheet_id: str, range: str, shift_dimension: str = "ROWS") -> dict:
+    """Insert cells in an A1 range, shifting existing cells by ROWS or COLUMNS."""
+    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    shift = _dimension(shift_dimension)
+    _execute_batch_update(spreadsheet_id, [{"insertRange": {"range": grid, "shiftDimension": shift}}])
+    return {"range": range, "shiftDimension": shift}
+
+
+@mcp.tool()
+def delete_range(spreadsheet_id: str, range: str, shift_dimension: str = "ROWS") -> dict:
+    """Delete cells in an A1 range, shifting remaining cells by ROWS or COLUMNS."""
+    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    shift = _dimension(shift_dimension)
+    _execute_batch_update(spreadsheet_id, [{"deleteRange": {"range": grid, "shiftDimension": shift}}])
+    return {"range": range, "shiftDimension": shift}
+
+
+@mcp.tool()
+def copy_range(
+    spreadsheet_id: str,
+    source_range: str,
+    destination_range: str,
+    paste_type: str = "PASTE_NORMAL",
+    paste_orientation: str = "NORMAL",
+) -> dict:
+    """Copy a range to another range."""
+    sid = _sid(spreadsheet_id)
+    req = {
+        "copyPaste": {
+            "source": client.resolve_grid_range(sid, source_range),
+            "destination": client.resolve_grid_range(sid, destination_range),
+            "pasteType": paste_type.upper(),
+            "pasteOrientation": paste_orientation.upper(),
+        }
+    }
+    _execute_batch_update(spreadsheet_id, [req])
+    return {"sourceRange": source_range, "destinationRange": destination_range, "pasteType": paste_type.upper()}
+
+
+@mcp.tool()
+def cut_paste_range(
+    spreadsheet_id: str,
+    source_range: str,
+    destination_cell: str,
+    paste_type: str = "PASTE_NORMAL",
+) -> dict:
+    """Cut a range and paste it starting at a destination cell."""
+    sid = _sid(spreadsheet_id)
+    req = {
+        "cutPaste": {
+            "source": client.resolve_grid_range(sid, source_range),
+            "destination": _single_cell_coordinate(sid, destination_cell),
+            "pasteType": paste_type.upper(),
+        }
+    }
+    _execute_batch_update(spreadsheet_id, [req])
+    return {"sourceRange": source_range, "destinationCell": destination_cell, "pasteType": paste_type.upper()}
+
+
+@mcp.tool()
+def paste_delimited_data(
+    spreadsheet_id: str,
+    start_cell: str,
+    data: str,
+    delimiter: str = ",",
+    paste_type: str = "PASTE_NORMAL",
+    html: bool = False,
+) -> dict:
+    """Paste delimited text/HTML starting at a single cell."""
+    req = {
+        "pasteData": {
+            "coordinate": _single_cell_coordinate(_sid(spreadsheet_id), start_cell),
+            "data": data,
+            "delimiter": delimiter,
+            "type": paste_type.upper(),
+            "html": html,
+        }
+    }
+    _execute_batch_update(spreadsheet_id, [req])
+    return {"startCell": start_cell, "pasteType": paste_type.upper()}
+
+
+@mcp.tool()
+def sort_range(spreadsheet_id: str, range: str, sort_specs: list[dict]) -> dict:
+    """Sort a range using Sheets API ``SortSpec`` objects."""
+    if not sort_specs:
+        raise ValueError("Provide at least one sort spec.")
+    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    _execute_batch_update(spreadsheet_id, [{"sortRange": {"range": grid, "sortSpecs": sort_specs}}])
+    return {"range": range, "sortSpecs": sort_specs}
+
+
+@mcp.tool()
+def find_replace(
+    spreadsheet_id: str,
+    find: str,
+    replacement: str,
+    range: str | None = None,
+    all_sheets: bool = False,
+    match_case: bool = False,
+    match_entire_cell: bool = False,
+    search_by_regex: bool = False,
+    include_formulas: bool = False,
+) -> dict:
+    """Find and replace text in one range or all sheets."""
+    body: dict[str, Any] = {
+        "find": find,
+        "replacement": replacement,
+        "matchCase": match_case,
+        "matchEntireCell": match_entire_cell,
+        "searchByRegex": search_by_regex,
+        "includeFormulas": include_formulas,
+    }
+    if range:
+        body["range"] = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    else:
+        body["allSheets"] = all_sheets or True
+    result = _execute_batch_update(spreadsheet_id, [{"findReplace": body}])
+    reply = result.get("replies", [{}])[0].get("findReplace", {})
+    return {"occurrencesChanged": reply.get("occurrencesChanged"), "rowsChanged": reply.get("rowsChanged"), "sheetsChanged": reply.get("sheetsChanged")}
+
+
+@mcp.tool()
+def trim_whitespace(spreadsheet_id: str, range: str) -> dict:
+    """Trim leading/trailing/repeated whitespace in each cell in an A1 range."""
+    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    result = _execute_batch_update(spreadsheet_id, [{"trimWhitespace": {"range": grid}}])
+    reply = result.get("replies", [{}])[0].get("trimWhitespace", {})
+    return {"range": range, "cellsChangedCount": reply.get("cellsChangedCount")}
+
+
+@mcp.tool()
+def delete_duplicates(
+    spreadsheet_id: str,
+    range: str,
+    comparison_columns: list[int] | None = None,
+) -> dict:
+    """Remove duplicate rows from a range, optionally comparing only column indexes."""
+    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    body: dict[str, Any] = {"range": grid}
+    if comparison_columns:
+        body["comparisonColumns"] = [
+            {
+                "sheetId": grid["sheetId"],
+                "dimension": "COLUMNS",
+                "startIndex": col,
+                "endIndex": col + 1,
+            }
+            for col in comparison_columns
+        ]
+    result = _execute_batch_update(spreadsheet_id, [{"deleteDuplicates": body}])
+    reply = result.get("replies", [{}])[0].get("deleteDuplicates", {})
+    return {"range": range, "duplicatesRemovedCount": reply.get("duplicatesRemovedCount")}
+
+
+@mcp.tool()
+def text_to_columns(
+    spreadsheet_id: str,
+    source_range: str,
+    delimiter_type: str = "AUTODETECT",
+    delimiter: str | None = None,
+) -> dict:
+    """Split a single-column range into multiple columns."""
+    body: dict[str, Any] = {
+        "source": client.resolve_grid_range(_sid(spreadsheet_id), source_range),
+        "delimiterType": delimiter_type.upper(),
+    }
+    if delimiter is not None:
+        body["delimiter"] = delimiter
+    _execute_batch_update(spreadsheet_id, [{"textToColumns": body}])
+    return {"sourceRange": source_range, "delimiterType": delimiter_type.upper()}
+
+
+@mcp.tool()
+def auto_fill(
+    spreadsheet_id: str,
+    range: str,
+    use_alternate_series: bool = False,
+) -> dict:
+    """Autofill within an A1 range by detecting existing source data."""
+    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    req = {
+        "autoFill": {
+            "range": grid,
+            "useAlternateSeries": use_alternate_series,
+        }
+    }
+    _execute_batch_update(spreadsheet_id, [req])
+    return {"range": range, "useAlternateSeries": use_alternate_series}
+
+
+@mcp.tool()
+def randomize_range(spreadsheet_id: str, range: str) -> dict:
+    """Randomize row order inside an A1 range."""
+    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    _execute_batch_update(spreadsheet_id, [{"randomizeRange": {"range": grid}}])
+    return {"range": range, "randomized": True}
+
+
+# ---------------------------------------------------------------------------
+# Filters and validation
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def set_basic_filter(
+    spreadsheet_id: str,
+    range: str,
+    sort_specs: list[dict] | None = None,
+    filter_specs: list[dict] | None = None,
+) -> dict:
+    """Set the sheet's basic filter over an A1 range."""
+    basic_filter: dict[str, Any] = {"range": client.resolve_grid_range(_sid(spreadsheet_id), range)}
+    if sort_specs:
+        basic_filter["sortSpecs"] = sort_specs
+    if filter_specs:
+        basic_filter["filterSpecs"] = filter_specs
+    _execute_batch_update(spreadsheet_id, [{"setBasicFilter": {"filter": basic_filter}}])
+    return {"range": range, "set": True}
+
+
+@mcp.tool()
+def clear_basic_filter(spreadsheet_id: str, sheet: str) -> dict:
+    """Clear the basic filter on a sheet."""
+    sheet_id = client.resolve_sheet_id(_sid(spreadsheet_id), sheet)
+    _execute_batch_update(spreadsheet_id, [{"clearBasicFilter": {"sheetId": sheet_id}}])
+    return {"sheetId": sheet_id, "cleared": True}
+
+
+@mcp.tool()
+def add_filter_view(
+    spreadsheet_id: str,
+    range: str,
+    title: str | None = None,
+    sort_specs: list[dict] | None = None,
+    filter_specs: list[dict] | None = None,
+) -> dict:
+    """Add a filter view over an A1 range."""
+    filter_view: dict[str, Any] = {"range": client.resolve_grid_range(_sid(spreadsheet_id), range)}
+    if title is not None:
+        filter_view["title"] = title
+    if sort_specs:
+        filter_view["sortSpecs"] = sort_specs
+    if filter_specs:
+        filter_view["filterSpecs"] = filter_specs
+    result = _execute_batch_update(spreadsheet_id, [{"addFilterView": {"filter": filter_view}}])
+    added = result.get("replies", [{}])[0].get("addFilterView", {}).get("filter", {})
+    return {"filterViewId": added.get("filterViewId"), "title": added.get("title", title)}
+
+
+@mcp.tool()
+def update_filter_view(
+    spreadsheet_id: str,
+    filter_view: dict,
+    fields: list[str] | None = None,
+) -> dict:
+    """Update a filter view using a Sheets API FilterView object."""
+    _execute_batch_update(spreadsheet_id, [{"updateFilterView": {"filter": filter_view, "fields": _field_mask(fields)}}])
+    return {"filterViewId": filter_view.get("filterViewId"), "updatedFields": fields or ["*"]}
+
+
+@mcp.tool()
+def delete_filter_view(spreadsheet_id: str, filter_view_id: int) -> dict:
+    """Delete a filter view by ID."""
+    _execute_batch_update(spreadsheet_id, [{"deleteFilterView": {"filterId": filter_view_id}}])
+    return {"filterViewId": filter_view_id, "deleted": True}
+
+
+@mcp.tool()
+def set_data_validation(
+    spreadsheet_id: str,
+    range: str,
+    condition_type: str,
+    values: list[str] | None = None,
+    input_message: str | None = None,
+    strict: bool = True,
+    show_custom_ui: bool = True,
+    filtered_rows_included: bool = False,
+) -> dict:
+    """Set a data validation rule on an A1 range."""
+    rule: dict[str, Any] = {
+        "condition": _condition(condition_type, values),
+        "strict": strict,
+        "showCustomUi": show_custom_ui,
+    }
+    if input_message is not None:
+        rule["inputMessage"] = input_message
+    req = {
+        "setDataValidation": {
+            "range": client.resolve_grid_range(_sid(spreadsheet_id), range),
+            "rule": rule,
+            "filteredRowsIncluded": filtered_rows_included,
+        }
+    }
+    _execute_batch_update(spreadsheet_id, [req])
+    return {"range": range, "conditionType": condition_type.upper()}
+
+
+@mcp.tool()
+def clear_data_validation(spreadsheet_id: str, range: str) -> dict:
+    """Clear data validation from an A1 range."""
+    req = {"setDataValidation": {"range": client.resolve_grid_range(_sid(spreadsheet_id), range)}}
+    _execute_batch_update(spreadsheet_id, [req])
+    return {"range": range, "cleared": True}
+
+
+# ---------------------------------------------------------------------------
+# Named/protected ranges, banding, groups, and tables
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def add_named_range(spreadsheet_id: str, name: str, range: str) -> dict:
+    """Create a named range over an A1 range."""
+    named_range = {"name": name, "range": client.resolve_grid_range(_sid(spreadsheet_id), range)}
+    result = _execute_batch_update(spreadsheet_id, [{"addNamedRange": {"namedRange": named_range}}])
+    added = result.get("replies", [{}])[0].get("addNamedRange", {}).get("namedRange", {})
+    return {"namedRangeId": added.get("namedRangeId"), "name": added.get("name", name)}
+
+
+@mcp.tool()
+def update_named_range(
+    spreadsheet_id: str,
+    named_range_id: str,
+    name: str | None = None,
+    range: str | None = None,
+) -> dict:
+    """Update a named range's name and/or range."""
+    named_range: dict[str, Any] = {"namedRangeId": named_range_id}
+    fields = []
+    if name is not None:
+        named_range["name"] = name
+        fields.append("name")
+    if range is not None:
+        named_range["range"] = client.resolve_grid_range(_sid(spreadsheet_id), range)
+        fields.append("range")
+    if not fields:
+        raise ValueError("Provide name and/or range.")
+    req = {"updateNamedRange": {"namedRange": named_range, "fields": ",".join(fields)}}
+    _execute_batch_update(spreadsheet_id, [req])
+    return {"namedRangeId": named_range_id, "updatedFields": fields}
+
+
+@mcp.tool()
+def delete_named_range(spreadsheet_id: str, named_range_id: str) -> dict:
+    """Delete a named range by ID."""
+    _execute_batch_update(spreadsheet_id, [{"deleteNamedRange": {"namedRangeId": named_range_id}}])
+    return {"namedRangeId": named_range_id, "deleted": True}
+
+
+@mcp.tool()
+def add_protected_range(
+    spreadsheet_id: str,
+    range: str,
+    description: str | None = None,
+    warning_only: bool = True,
+    editors: dict | None = None,
+) -> dict:
+    """Protect an A1 range; defaults to warning-only protection."""
+    protected_range: dict[str, Any] = {
+        "range": client.resolve_grid_range(_sid(spreadsheet_id), range),
+        "warningOnly": warning_only,
+    }
+    if description is not None:
+        protected_range["description"] = description
+    if editors is not None:
+        protected_range["editors"] = editors
+    result = _execute_batch_update(spreadsheet_id, [{"addProtectedRange": {"protectedRange": protected_range}}])
+    added = result.get("replies", [{}])[0].get("addProtectedRange", {}).get("protectedRange", {})
+    return {"protectedRangeId": added.get("protectedRangeId"), "description": added.get("description", description)}
+
+
+@mcp.tool()
+def update_protected_range(
+    spreadsheet_id: str,
+    protected_range: dict,
+    fields: list[str] | None = None,
+) -> dict:
+    """Update a protected range using a Sheets API ProtectedRange object."""
+    req = {"updateProtectedRange": {"protectedRange": protected_range, "fields": _field_mask(fields)}}
+    _execute_batch_update(spreadsheet_id, [req])
+    return {"protectedRangeId": protected_range.get("protectedRangeId"), "updatedFields": fields or ["*"]}
+
+
+@mcp.tool()
+def delete_protected_range(spreadsheet_id: str, protected_range_id: int) -> dict:
+    """Delete a protected range by ID."""
+    _execute_batch_update(spreadsheet_id, [{"deleteProtectedRange": {"protectedRangeId": protected_range_id}}])
+    return {"protectedRangeId": protected_range_id, "deleted": True}
+
+
+@mcp.tool()
+def add_banding(
+    spreadsheet_id: str,
+    range: str,
+    row_properties: dict | None = None,
+    column_properties: dict | None = None,
+) -> dict:
+    """Add alternating-color banding to an A1 range."""
+    banded_range: dict[str, Any] = {"range": client.resolve_grid_range(_sid(spreadsheet_id), range)}
+    if row_properties is not None:
+        banded_range["rowProperties"] = row_properties
+    if column_properties is not None:
+        banded_range["columnProperties"] = column_properties
+    if "rowProperties" not in banded_range and "columnProperties" not in banded_range:
+        banded_range["rowProperties"] = {
+            "headerColor": parse_color("#d9ead3"),
+            "firstBandColor": parse_color("#ffffff"),
+            "secondBandColor": parse_color("#f3f3f3"),
+        }
+    result = _execute_batch_update(spreadsheet_id, [{"addBanding": {"bandedRange": banded_range}}])
+    added = result.get("replies", [{}])[0].get("addBanding", {}).get("bandedRange", {})
+    return {"bandedRangeId": added.get("bandedRangeId"), "range": range}
+
+
+@mcp.tool()
+def update_banding(spreadsheet_id: str, banded_range: dict, fields: list[str] | None = None) -> dict:
+    """Update banding using a Sheets API BandedRange object."""
+    _execute_batch_update(spreadsheet_id, [{"updateBanding": {"bandedRange": banded_range, "fields": _field_mask(fields)}}])
+    return {"bandedRangeId": banded_range.get("bandedRangeId"), "updatedFields": fields or ["*"]}
+
+
+@mcp.tool()
+def delete_banding(spreadsheet_id: str, banded_range_id: int) -> dict:
+    """Delete banding by ID."""
+    _execute_batch_update(spreadsheet_id, [{"deleteBanding": {"bandedRangeId": banded_range_id}}])
+    return {"bandedRangeId": banded_range_id, "deleted": True}
+
+
+@mcp.tool()
+def add_dimension_group(
+    spreadsheet_id: str,
+    sheet: str,
+    dimension: str,
+    start_index: int,
+    end_index: int,
+) -> dict:
+    """Group rows or columns over a zero-based, half-open range."""
+    rng = _dimension_range(spreadsheet_id, sheet, dimension, start_index, end_index)
+    result = _execute_batch_update(spreadsheet_id, [{"addDimensionGroup": {"range": rng}}])
+    group = result.get("replies", [{}])[0].get("addDimensionGroup", {}).get("dimensionGroups", [])
+    return {"range": rng, "dimensionGroups": group}
+
+
+@mcp.tool()
+def update_dimension_group(
+    spreadsheet_id: str,
+    sheet: str,
+    dimension: str,
+    start_index: int,
+    end_index: int,
+    collapsed: bool,
+) -> dict:
+    """Collapse or expand a row/column group."""
+    group = {
+        "range": _dimension_range(spreadsheet_id, sheet, dimension, start_index, end_index),
+        "collapsed": collapsed,
+    }
+    _execute_batch_update(spreadsheet_id, [{"updateDimensionGroup": {"dimensionGroup": group, "fields": "collapsed"}}])
+    return {"range": group["range"], "collapsed": collapsed}
+
+
+@mcp.tool()
+def delete_dimension_group(
+    spreadsheet_id: str,
+    sheet: str,
+    dimension: str,
+    start_index: int,
+    end_index: int,
+) -> dict:
+    """Delete a row/column group."""
+    rng = _dimension_range(spreadsheet_id, sheet, dimension, start_index, end_index)
+    _execute_batch_update(spreadsheet_id, [{"deleteDimensionGroup": {"range": rng}}])
+    return {"range": rng, "deleted": True}
+
+
+@mcp.tool()
+def add_table(
+    spreadsheet_id: str,
+    range: str,
+    name: str | None = None,
+    column_properties: list[dict] | None = None,
+    rows_properties: dict | None = None,
+) -> dict:
+    """Add a Sheets table over an A1 range."""
+    table: dict[str, Any] = {"range": client.resolve_grid_range(_sid(spreadsheet_id), range)}
+    if name is not None:
+        table["name"] = name
+    if column_properties:
+        table["columnProperties"] = column_properties
+    if rows_properties:
+        table["rowsProperties"] = rows_properties
+    result = _execute_batch_update(spreadsheet_id, [{"addTable": {"table": table}}])
+    added = result.get("replies", [{}])[0].get("addTable", {}).get("table", {})
+    return {"tableId": added.get("tableId"), "name": added.get("name", name)}
+
+
+@mcp.tool()
+def update_table(spreadsheet_id: str, table: dict, fields: list[str] | None = None) -> dict:
+    """Update a table using a Sheets API Table object."""
+    _execute_batch_update(spreadsheet_id, [{"updateTable": {"table": table, "fields": _field_mask(fields)}}])
+    return {"tableId": table.get("tableId"), "updatedFields": fields or ["*"]}
+
+
+@mcp.tool()
+def delete_table(spreadsheet_id: str, table_id: str) -> dict:
+    """Delete a table by ID."""
+    _execute_batch_update(spreadsheet_id, [{"deleteTable": {"tableId": table_id}}])
+    return {"tableId": table_id, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
 # Charts
 # ---------------------------------------------------------------------------
 
@@ -780,6 +1715,197 @@ def create_chart(
     }
 
 
+@mcp.tool()
+def create_chart_from_spec(
+    spreadsheet_id: str,
+    sheet: str,
+    chart_spec: dict,
+    anchor_cell: str = "E2",
+    width_pixels: int = 600,
+    height_pixels: int = 371,
+    offset_x_pixels: int = 0,
+    offset_y_pixels: int = 0,
+) -> dict:
+    """Create an embedded chart from a full Sheets API ChartSpec object.
+
+    Use this for histogram, scorecard, bubble, candlestick, waterfall, treemap,
+    org, or other chart specs not covered by ``create_chart``.
+    """
+    req = {
+        "addChart": {
+            "chart": {
+                "spec": chart_spec,
+                "position": _overlay_position(
+                    spreadsheet_id,
+                    sheet,
+                    anchor_cell,
+                    width_pixels,
+                    height_pixels,
+                    offset_x_pixels,
+                    offset_y_pixels,
+                ),
+            }
+        }
+    }
+    result = _execute_batch_update(spreadsheet_id, [req])
+    chart = result.get("replies", [{}])[0].get("addChart", {}).get("chart", {})
+    return {"chartId": chart.get("chartId"), "sheet": sheet}
+
+
+@mcp.tool()
+def update_chart(spreadsheet_id: str, chart_id: int, chart_spec: dict) -> dict:
+    """Replace a chart's spec. Use ``move_chart`` to move or resize it."""
+    _execute_batch_update(spreadsheet_id, [{"updateChartSpec": {"chartId": chart_id, "spec": chart_spec}}])
+    return {"chartId": chart_id, "updated": True}
+
+
+@mcp.tool()
+def delete_chart(spreadsheet_id: str, chart_id: int) -> dict:
+    """Delete a chart or other embedded object by ID."""
+    _execute_batch_update(spreadsheet_id, [{"deleteEmbeddedObject": {"objectId": chart_id}}])
+    return {"objectId": chart_id, "deleted": True}
+
+
+@mcp.tool()
+def move_chart(
+    spreadsheet_id: str,
+    chart_id: int,
+    sheet: str,
+    anchor_cell: str = "E2",
+    width_pixels: int = 600,
+    height_pixels: int = 371,
+    offset_x_pixels: int = 0,
+    offset_y_pixels: int = 0,
+) -> dict:
+    """Move and/or resize a chart using overlay positioning."""
+    req = {
+        "updateEmbeddedObjectPosition": {
+            "objectId": chart_id,
+            "newPosition": _overlay_position(
+                spreadsheet_id,
+                sheet,
+                anchor_cell,
+                width_pixels,
+                height_pixels,
+                offset_x_pixels,
+                offset_y_pixels,
+            ),
+            "fields": "anchorCell,offsetXPixels,offsetYPixels,widthPixels,heightPixels",
+        }
+    }
+    _execute_batch_update(spreadsheet_id, [req])
+    return {"chartId": chart_id, "sheet": sheet, "anchorCell": anchor_cell}
+
+
+@mcp.tool()
+def set_chart_border(
+    spreadsheet_id: str,
+    chart_id: int,
+    color: str = "#000000",
+) -> dict:
+    """Set an embedded object's border color."""
+    req = {
+        "updateEmbeddedObjectBorder": {
+            "objectId": chart_id,
+            "border": {"color": parse_color(color)},
+            "fields": "color",
+        }
+    }
+    _execute_batch_update(spreadsheet_id, [req])
+    return {"objectId": chart_id, "borderColor": color}
+
+
+@mcp.tool()
+def create_pivot_table(
+    spreadsheet_id: str,
+    source_range: str,
+    destination_cell: str,
+    rows: list[dict] | None = None,
+    columns: list[dict] | None = None,
+    values: list[dict] | None = None,
+    filter_specs: list[dict] | None = None,
+    value_layout: str = "HORIZONTAL",
+) -> dict:
+    """Create a pivot table at a destination cell.
+
+    ``rows``, ``columns``, ``values``, and ``filter_specs`` use the Sheets API
+    PivotGroup/PivotValue/PivotFilterSpec shapes.
+    """
+    pivot_table: dict[str, Any] = {
+        "source": client.resolve_grid_range(_sid(spreadsheet_id), source_range),
+        "valueLayout": value_layout.upper(),
+    }
+    if rows:
+        pivot_table["rows"] = rows
+    if columns:
+        pivot_table["columns"] = columns
+    if values:
+        pivot_table["values"] = values
+    if filter_specs:
+        pivot_table["filterSpecs"] = filter_specs
+
+    req = {
+        "updateCells": {
+            "start": _single_cell_coordinate(_sid(spreadsheet_id), destination_cell),
+            "rows": [{"values": [{"pivotTable": pivot_table}]}],
+            "fields": "pivotTable",
+        }
+    }
+    _execute_batch_update(spreadsheet_id, [req])
+    return {"sourceRange": source_range, "destinationCell": destination_cell, "valueLayout": value_layout.upper()}
+
+
+@mcp.tool()
+def add_slicer(
+    spreadsheet_id: str,
+    sheet: str,
+    data_range: str,
+    column_index: int,
+    title: str | None = None,
+    filter_criteria: dict | None = None,
+    anchor_cell: str = "E2",
+    width_pixels: int = 300,
+    height_pixels: int = 200,
+) -> dict:
+    """Add a slicer for a data range."""
+    spec: dict[str, Any] = {
+        "dataRange": client.resolve_grid_range(_sid(spreadsheet_id), data_range, default_sheet=sheet),
+        "columnIndex": column_index,
+    }
+    if title is not None:
+        spec["title"] = title
+    if filter_criteria is not None:
+        spec["filterCriteria"] = filter_criteria
+    req = {
+        "addSlicer": {
+            "slicer": {
+                "spec": spec,
+                "position": _overlay_position(spreadsheet_id, sheet, anchor_cell, width_pixels, height_pixels),
+            }
+        }
+    }
+    result = _execute_batch_update(spreadsheet_id, [req])
+    slicer = result.get("replies", [{}])[0].get("addSlicer", {}).get("slicer", {})
+    return {"slicerId": slicer.get("slicerId"), "title": title}
+
+
+@mcp.tool()
+def update_slicer(spreadsheet_id: str, slicer_id: int, spec: dict, fields: list[str] | None = None) -> dict:
+    """Update a slicer spec by ID."""
+    _execute_batch_update(
+        spreadsheet_id,
+        [{"updateSlicerSpec": {"slicerId": slicer_id, "spec": spec, "fields": _field_mask(fields)}}],
+    )
+    return {"slicerId": slicer_id, "updatedFields": fields or ["*"]}
+
+
+@mcp.tool()
+def delete_slicer(spreadsheet_id: str, slicer_id: int) -> dict:
+    """Delete a slicer by embedded object ID."""
+    _execute_batch_update(spreadsheet_id, [{"deleteEmbeddedObject": {"objectId": slicer_id}}])
+    return {"slicerId": slicer_id, "deleted": True}
+
+
 # ---------------------------------------------------------------------------
 # Conditional formatting
 # ---------------------------------------------------------------------------
@@ -844,6 +1970,59 @@ def add_conditional_format(
     }
     client.batch_update(spreadsheet_id, [req])
     return {"range": range, "conditionType": condition_type.upper()}
+
+
+@mcp.tool()
+def update_conditional_format(
+    spreadsheet_id: str,
+    sheet: str,
+    index: int,
+    range: str,
+    condition_type: str,
+    values: list[str] | None = None,
+    background_color: str | None = None,
+    text_color: str | None = None,
+    bold: bool | None = None,
+    new_index: int | None = None,
+) -> dict:
+    """Replace a conditional-format rule at ``index``."""
+    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    fmt: dict[str, Any] = {}
+    if background_color is not None:
+        fmt["backgroundColor"] = parse_color(background_color)
+    text_fmt: dict[str, Any] = {}
+    if text_color is not None:
+        text_fmt["foregroundColor"] = parse_color(text_color)
+    if bold is not None:
+        text_fmt["bold"] = bold
+    if text_fmt:
+        fmt["textFormat"] = text_fmt
+    if not fmt:
+        raise ValueError("Provide at least one of background_color, text_color, bold.")
+
+    body: dict[str, Any] = {
+        "rule": {
+            "ranges": [grid],
+            "booleanRule": {"condition": _condition(condition_type, values), "format": fmt},
+        },
+        "index": index,
+        "sheetId": client.resolve_sheet_id(_sid(spreadsheet_id), sheet),
+    }
+    if new_index is not None:
+        body["newIndex"] = new_index
+    _execute_batch_update(spreadsheet_id, [{"updateConditionalFormatRule": body}])
+    return {"range": range, "sheet": sheet, "index": index, "newIndex": new_index, "conditionType": condition_type.upper()}
+
+
+@mcp.tool()
+def delete_conditional_format(spreadsheet_id: str, sheet: str, index: int) -> dict:
+    """Delete a conditional-format rule by sheet and index."""
+    body: dict[str, Any] = {
+        "index": index,
+        "sheetId": client.resolve_sheet_id(_sid(spreadsheet_id), sheet),
+    }
+    _execute_batch_update(spreadsheet_id, [{"deleteConditionalFormatRule": body}])
+    return {"index": index, "sheet": sheet, "deleted": True}
 
 
 def main() -> None:

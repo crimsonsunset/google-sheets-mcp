@@ -8,11 +8,20 @@ API v4. Runs over stdio, authenticates with your own Google account via OAuth.
 
 **Structure**
 - `get_spreadsheet_info` — list sheets with ids, dimensions, frozen rows/cols
-- `create_spreadsheet`, `add_sheet`, `rename_sheet`
+- `create_spreadsheet`, `add_sheet`, `rename_sheet`, `delete_sheet`,
+  `duplicate_sheet`
 
 **Cell values**
 - `read_range`, `batch_read` — read A1 ranges (formatted, unformatted, or formulas)
-- `write_range`, `append_rows`, `clear_range`
+- `write_range`, `batch_write`, `append_rows`, `clear_range`, `batch_clear`
+
+**Data operations**
+- `insert_rows`, `delete_rows`, `insert_columns`, `delete_columns`
+- `append_rows_to_sheet`, `append_columns_to_sheet`, `move_rows_or_columns`
+- `insert_range`, `delete_range`, `copy_range`, `cut_paste_range`,
+  `paste_delimited_data`, `auto_fill`
+- `sort_range`, `find_replace`, `trim_whitespace`, `delete_duplicates`,
+  `text_to_columns`, `randomize_range`
 
 **Formatting**
 - `format_cells` — bold/italic/underline/strikethrough, font size & family,
@@ -21,12 +30,31 @@ API v4. Runs over stdio, authenticates with your own Google account via OAuth.
 - `merge_cells`, `unmerge_cells`
 - `set_dimension_size` (column width / row height), `auto_resize_dimensions`
 - `freeze` rows/columns
-- `add_conditional_format` — boolean rules (number/text/custom-formula conditions)
-- `batch_update` — raw Sheets API `batchUpdate` escape hatch for anything else
+- `add_conditional_format`, `update_conditional_format`,
+  `delete_conditional_format`
+- `add_banding`, `update_banding`, `delete_banding`
+
+**Filters, validation, and ranges**
+- `set_basic_filter`, `clear_basic_filter`
+- `add_filter_view`, `update_filter_view`, `delete_filter_view`
+- `set_data_validation`, `clear_data_validation`
+- `add_named_range`, `update_named_range`, `delete_named_range`
+- `add_protected_range`, `update_protected_range`, `delete_protected_range`
+- `add_dimension_group`, `update_dimension_group`, `delete_dimension_group`
+- `add_table`, `update_table`, `delete_table`
 
 **Charts**
 - `create_chart` — create embedded column, bar, line, area, scatter, combo,
   stepped-area, pie, and donut charts from existing row/column ranges
+- `create_chart_from_spec` — create any Sheets API chart spec, including
+  histogram, scorecard, bubble, candlestick, waterfall, treemap, and org charts
+- `update_chart`, `delete_chart`, `move_chart`, `set_chart_border`
+- `create_pivot_table`
+- `add_slicer`, `update_slicer`, `delete_slicer`
+
+**Advanced**
+- `batch_update_advanced` — allowlisted raw Sheets API `batchUpdate` requests
+  (max 50 per call; data-source lifecycle requests are blocked)
 
 ## Setup
 
