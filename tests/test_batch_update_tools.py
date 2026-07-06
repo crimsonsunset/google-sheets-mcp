@@ -20,7 +20,7 @@ class FakeClient:
 @pytest.fixture
 def captured(monkeypatch):
     calls = []
-    monkeypatch.setattr(server, "client", FakeClient())
+    monkeypatch.setattr(server, "current_client", lambda: FakeClient())
 
     def fake_execute(spreadsheet_id, requests, response_ranges=None, include_spreadsheet_in_response=False):
         calls.append(

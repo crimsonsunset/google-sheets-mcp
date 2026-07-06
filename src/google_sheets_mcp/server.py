@@ -15,9 +15,83 @@ from mcp.server.fastmcp import FastMCP
 from .a1 import a1_to_grid_range, split_sheet_and_range
 from .client import SheetsClient
 from .colors import parse_color
+from .config import mode as _mode
+from .refs import resolve_spreadsheet_id
 
-mcp = FastMCP("google-sheets")
-client = SheetsClient()
+# ---------------------------------------------------------------------------
+# Server construction (mode-aware) and per-request client resolution
+# ---------------------------------------------------------------------------
+
+
+def _build_mcp() -> FastMCP:
+    """Build the FastMCP server for the active mode.
+
+    local (default): plain stdio server using one shared on-disk identity.
+    group: a Streamable-HTTP server that acts as an OAuth Authorization Server
+    bridging each user to Google (see ``oauth_bridge.py``). Auth has to be
+    configured at construction time, so we branch here at import time on
+    ``$GSHEETS_MCP_MODE``.
+    """
+    if _mode() == "group":
+        from mcp.server.auth.settings import (
+            AuthSettings,
+            ClientRegistrationOptions,
+            RevocationOptions,
+        )
+
+        from .config import load_group_config
+        from .oauth_bridge import GoogleBridgeProvider, register_callback
+
+        cfg = load_group_config()
+        provider = GoogleBridgeProvider(cfg)
+        server = FastMCP(
+            "google-sheets",
+            host=cfg.host,
+            port=cfg.port,
+            auth_server_provider=provider,
+            auth=AuthSettings(
+                issuer_url=cfg.issuer_url,
+                resource_server_url=cfg.issuer_url,
+                client_registration_options=ClientRegistrationOptions(
+                    enabled=True,
+                    valid_scopes=cfg.scopes,
+                    default_scopes=cfg.scopes,
+                ),
+                revocation_options=RevocationOptions(enabled=True),
+                required_scopes=cfg.scopes,
+            ),
+        )
+        register_callback(server, provider)
+        return server
+
+    return FastMCP("google-sheets")
+
+
+mcp = _build_mcp()
+
+_local_singleton: SheetsClient | None = None
+
+
+def current_client() -> SheetsClient:
+    """Return the ``SheetsClient`` for the current request.
+
+    group: build a client from the caller's verified Google access token
+    (carried in the MCP access token's claims). local: a shared singleton.
+    """
+    if _mode() == "group":
+        from mcp.server.auth.middleware.auth_context import get_access_token
+
+        from .auth import credentials_from_access_token
+
+        token = get_access_token()
+        if token is None or not token.claims or "g_at" not in token.claims:
+            raise RuntimeError("No authenticated Google credentials on this request.")
+        return SheetsClient(credentials_from_access_token(token.claims["g_at"]))
+
+    global _local_singleton
+    if _local_singleton is None:
+        _local_singleton = SheetsClient()
+    return _local_singleton
 
 # ---------------------------------------------------------------------------
 # Validation helpers
@@ -121,13 +195,15 @@ _NETWORK_FORMULA_RE = re.compile(
 
 
 def _sid(spreadsheet_id: str) -> str:
-    """Validate and return a spreadsheet ID."""
-    if not _SPREADSHEET_ID_RE.fullmatch(spreadsheet_id):
+    """Validate and return a spreadsheet ID, accepting a full Sheets URL too."""
+    candidate = resolve_spreadsheet_id(spreadsheet_id)
+    if not _SPREADSHEET_ID_RE.fullmatch(candidate):
         raise ValueError(
-            "Invalid spreadsheet_id — expected an alphanumeric Google Sheets ID "
-            "(20–100 characters, letters/digits/hyphens/underscores)."
+            "Invalid spreadsheet_id — expected a Google Sheets ID "
+            "(20–100 chars of letters/digits/hyphens/underscores) or a full "
+            "https://docs.google.com/spreadsheets/d/… URL."
         )
-    return spreadsheet_id
+    return candidate
 
 
 def _render_option(opt: str) -> str:
@@ -201,7 +277,7 @@ def _execute_batch_update(
     if response_ranges:
         body["responseRanges"] = response_ranges
     return _api(
-        client.spreadsheets.batchUpdate,
+        current_client().spreadsheets.batchUpdate,
         spreadsheetId=_sid(spreadsheet_id),
         body=body,
     )
@@ -224,7 +300,7 @@ def _dimension_range(
     if start_index < 0 or end_index <= start_index:
         raise ValueError("Dimension indices must be zero-based and end_index must be greater than start_index.")
     return {
-        "sheetId": client.resolve_sheet_id(_sid(spreadsheet_id), sheet),
+        "sheetId": current_client().resolve_sheet_id(_sid(spreadsheet_id), sheet),
         "dimension": _dimension(dimension),
         "startIndex": start_index,
         "endIndex": end_index,
@@ -232,7 +308,7 @@ def _dimension_range(
 
 
 def _single_cell_coordinate(spreadsheet_id: str, cell: str, default_sheet: str | int | None = None) -> dict:
-    grid = client.resolve_grid_range(_sid(spreadsheet_id), cell, default_sheet=default_sheet)
+    grid = current_client().resolve_grid_range(_sid(spreadsheet_id), cell, default_sheet=default_sheet)
     if (
         "startRowIndex" not in grid
         or "startColumnIndex" not in grid
@@ -256,7 +332,7 @@ def _overlay_position(
     offset_x_pixels: int = 0,
     offset_y_pixels: int = 0,
 ) -> dict:
-    sheet_id = client.resolve_sheet_id(_sid(spreadsheet_id), sheet)
+    sheet_id = current_client().resolve_sheet_id(_sid(spreadsheet_id), sheet)
     if width_pixels <= 0 or height_pixels <= 0:
         raise ValueError("width_pixels and height_pixels must be positive.")
     return {
@@ -463,7 +539,7 @@ def get_spreadsheet_info(spreadsheet_id: str) -> dict:
     Returns each sheet's title, numeric ``sheetId``, index, dimensions, and any
     frozen rows/columns. Use this first to discover sheet names and sizes.
     """
-    meta = client.get_metadata(_sid(spreadsheet_id))
+    meta = current_client().get_metadata(_sid(spreadsheet_id))
     sheets = []
     for s in meta.get("sheets", []):
         p = s["properties"]
@@ -538,7 +614,7 @@ def create_spreadsheet(title: str, sheet_titles: list[str] | None = None) -> dic
     if sheet_titles:
         body["sheets"] = [{"properties": {"title": t}} for t in sheet_titles]
     result = _api(
-        client.spreadsheets.create,
+        current_client().spreadsheets.create,
         body=body,
         fields="spreadsheetId,spreadsheetUrl,properties.title",
     )
@@ -565,7 +641,7 @@ def add_sheet(
             }
         }
     }
-    result = client.batch_update(_sid(spreadsheet_id), [req])
+    result = current_client().batch_update(_sid(spreadsheet_id), [req])
     props = result["replies"][0]["addSheet"]["properties"]
     return {"title": props["title"], "sheetId": props["sheetId"]}
 
@@ -573,21 +649,21 @@ def add_sheet(
 @mcp.tool()
 def rename_sheet(spreadsheet_id: str, sheet: str, new_title: str) -> dict:
     """Rename a sheet/tab."""
-    sheet_id = client.resolve_sheet_id(_sid(spreadsheet_id), sheet)
+    sheet_id = current_client().resolve_sheet_id(_sid(spreadsheet_id), sheet)
     req = {
         "updateSheetProperties": {
             "properties": {"sheetId": sheet_id, "title": new_title},
             "fields": "title",
         }
     }
-    client.batch_update(spreadsheet_id, [req])
+    current_client().batch_update(spreadsheet_id, [req])
     return {"sheetId": sheet_id, "title": new_title}
 
 
 @mcp.tool()
 def delete_sheet(spreadsheet_id: str, sheet: str) -> dict:
     """Delete a sheet/tab by name or numeric sheetId."""
-    sheet_id = client.resolve_sheet_id(_sid(spreadsheet_id), sheet)
+    sheet_id = current_client().resolve_sheet_id(_sid(spreadsheet_id), sheet)
     _execute_batch_update(spreadsheet_id, [{"deleteSheet": {"sheetId": sheet_id}}])
     return {"sheetId": sheet_id, "deleted": True}
 
@@ -600,7 +676,7 @@ def duplicate_sheet(
     insert_index: int | None = None,
 ) -> dict:
     """Duplicate a sheet/tab, optionally setting the new title and index."""
-    source_sheet_id = client.resolve_sheet_id(_sid(spreadsheet_id), sheet)
+    source_sheet_id = current_client().resolve_sheet_id(_sid(spreadsheet_id), sheet)
     body: dict[str, Any] = {"sourceSheetId": source_sheet_id}
     if new_title is not None:
         body["newSheetName"] = new_title
@@ -656,7 +732,7 @@ def read_range(
     Returns ``{"range", "values"}`` where ``values`` is a list of rows.
     """
     result = _api(
-        client.spreadsheets.values().get,
+        current_client().spreadsheets.values().get,
         spreadsheetId=_sid(spreadsheet_id),
         range=range,
         valueRenderOption=_render_option(value_render_option),
@@ -672,7 +748,7 @@ def batch_read(
 ) -> dict:
     """Read several A1 ranges at once. Returns ``{"valueRanges": [...]}``."""
     result = _api(
-        client.spreadsheets.values().batchGet,
+        current_client().spreadsheets.values().batchGet,
         spreadsheetId=_sid(spreadsheet_id),
         ranges=ranges,
         valueRenderOption=_render_option(value_render_option),
@@ -700,7 +776,7 @@ def write_range(
     including those that can make external network requests.
     """
     result = _api(
-        client.spreadsheets.values().update,
+        current_client().spreadsheets.values().update,
         spreadsheetId=_sid(spreadsheet_id),
         range=range,
         valueInputOption=_input_option(value_input_option),
@@ -730,7 +806,7 @@ def append_rows(
     ``USER_ENTERED`` (evaluate formulas/dates/numbers — opt in explicitly).
     """
     result = _api(
-        client.spreadsheets.values().append,
+        current_client().spreadsheets.values().append,
         spreadsheetId=_sid(spreadsheet_id),
         range=range,
         valueInputOption=_input_option(value_input_option),
@@ -749,7 +825,7 @@ def append_rows(
 def clear_range(spreadsheet_id: str, range: str) -> dict:
     """Clear the *values* in an A1 range (formatting is preserved)."""
     result = _api(
-        client.spreadsheets.values().clear,
+        current_client().spreadsheets.values().clear,
         spreadsheetId=_sid(spreadsheet_id),
         range=range,
         body={},
@@ -769,7 +845,7 @@ def batch_write(
     ``{"range": "Sheet1!A1:B2", "values": [[1, 2], [3, 4]]}``.
     """
     result = _api(
-        client.spreadsheets.values().batchUpdate,
+        current_client().spreadsheets.values().batchUpdate,
         spreadsheetId=_sid(spreadsheet_id),
         body={"valueInputOption": _input_option(value_input_option), "data": data},
     )
@@ -785,7 +861,7 @@ def batch_write(
 def batch_clear(spreadsheet_id: str, ranges: list[str]) -> dict:
     """Clear values from multiple A1 ranges in one call."""
     result = _api(
-        client.spreadsheets.values().batchClear,
+        current_client().spreadsheets.values().batchClear,
         spreadsheetId=_sid(spreadsheet_id),
         body={"ranges": ranges},
     )
@@ -877,7 +953,7 @@ def format_cells(
     if not fields:
         raise ValueError("No formatting options provided — pass at least one.")
 
-    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    grid = current_client().resolve_grid_range(_sid(spreadsheet_id), range)
     req = {
         "repeatCell": {
             "range": grid,
@@ -885,7 +961,7 @@ def format_cells(
             "fields": ",".join(fields),
         }
     }
-    client.batch_update(spreadsheet_id, [req])
+    current_client().batch_update(spreadsheet_id, [req])
     return {"range": range, "appliedFields": fields}
 
 
@@ -909,7 +985,7 @@ def set_borders(
     ``left``/``right`` are the outer edges; ``inner_*`` set borders between cells.
     """
     border = {"style": style.upper(), "color": parse_color(color)}
-    body: dict[str, Any] = {"range": client.resolve_grid_range(_sid(spreadsheet_id), range)}
+    body: dict[str, Any] = {"range": current_client().resolve_grid_range(_sid(spreadsheet_id), range)}
     for edge, enabled in (
         ("top", top),
         ("bottom", bottom),
@@ -921,7 +997,7 @@ def set_borders(
         if enabled:
             body[edge] = dict(border)
 
-    client.batch_update(spreadsheet_id, [{"updateBorders": body}])
+    current_client().batch_update(spreadsheet_id, [{"updateBorders": body}])
     return {"range": range, "style": style.upper()}
 
 
@@ -932,8 +1008,8 @@ def merge_cells(spreadsheet_id: str, range: str, merge_type: str = "MERGE_ALL") 
     ``merge_type``: ``MERGE_ALL`` (one cell), ``MERGE_COLUMNS`` (merge each column
     vertically), or ``MERGE_ROWS`` (merge each row horizontally).
     """
-    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
-    client.batch_update(
+    grid = current_client().resolve_grid_range(_sid(spreadsheet_id), range)
+    current_client().batch_update(
         spreadsheet_id, [{"mergeCells": {"range": grid, "mergeType": merge_type.upper()}}]
     )
     return {"range": range, "mergeType": merge_type.upper()}
@@ -942,8 +1018,8 @@ def merge_cells(spreadsheet_id: str, range: str, merge_type: str = "MERGE_ALL") 
 @mcp.tool()
 def unmerge_cells(spreadsheet_id: str, range: str) -> dict:
     """Unmerge any merged cells overlapping an A1 range."""
-    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
-    client.batch_update(spreadsheet_id, [{"unmergeCells": {"range": grid}}])
+    grid = current_client().resolve_grid_range(_sid(spreadsheet_id), range)
+    current_client().batch_update(spreadsheet_id, [{"unmergeCells": {"range": grid}}])
     return {"range": range, "unmerged": True}
 
 
@@ -966,7 +1042,7 @@ def set_dimension_size(
     ``dimension``: ``COLUMNS`` or ``ROWS``. Indices are zero-based and half-open
     (``start_index=0, end_index=3`` covers the first three columns/rows).
     """
-    sheet_id = client.resolve_sheet_id(_sid(spreadsheet_id), sheet)
+    sheet_id = current_client().resolve_sheet_id(_sid(spreadsheet_id), sheet)
     req = {
         "updateDimensionProperties": {
             "range": {
@@ -979,7 +1055,7 @@ def set_dimension_size(
             "fields": "pixelSize",
         }
     }
-    client.batch_update(spreadsheet_id, [req])
+    current_client().batch_update(spreadsheet_id, [req])
     return {"sheetId": sheet_id, "dimension": dimension.upper(), "pixelSize": pixel_size}
 
 
@@ -992,7 +1068,7 @@ def auto_resize_dimensions(
     end_index: int,
 ) -> dict:
     """Auto-fit columns or rows to their contents (zero-based, half-open range)."""
-    sheet_id = client.resolve_sheet_id(_sid(spreadsheet_id), sheet)
+    sheet_id = current_client().resolve_sheet_id(_sid(spreadsheet_id), sheet)
     req = {
         "autoResizeDimensions": {
             "dimensions": {
@@ -1003,7 +1079,7 @@ def auto_resize_dimensions(
             }
         }
     }
-    client.batch_update(spreadsheet_id, [req])
+    current_client().batch_update(spreadsheet_id, [req])
     return {"sheetId": sheet_id, "dimension": dimension.upper(), "autoResized": True}
 
 
@@ -1018,7 +1094,7 @@ def freeze(
 
     Pass ``0`` to unfreeze. Leaving an argument as ``None`` keeps it unchanged.
     """
-    sheet_id = client.resolve_sheet_id(_sid(spreadsheet_id), sheet)
+    sheet_id = current_client().resolve_sheet_id(_sid(spreadsheet_id), sheet)
     grid_props: dict[str, int] = {}
     fields: list[str] = []
     if rows is not None:
@@ -1036,7 +1112,7 @@ def freeze(
             "fields": ",".join(fields),
         }
     }
-    client.batch_update(spreadsheet_id, [req])
+    current_client().batch_update(spreadsheet_id, [req])
     return {"sheetId": sheet_id, "frozenRows": rows, "frozenColumns": columns}
 
 
@@ -1096,7 +1172,7 @@ def append_rows_to_sheet(spreadsheet_id: str, sheet: str, length: int) -> dict:
     """Append empty rows to the end of a sheet."""
     if length <= 0:
         raise ValueError("length must be positive.")
-    sheet_id = client.resolve_sheet_id(_sid(spreadsheet_id), sheet)
+    sheet_id = current_client().resolve_sheet_id(_sid(spreadsheet_id), sheet)
     _execute_batch_update(spreadsheet_id, [{"appendDimension": {"sheetId": sheet_id, "dimension": "ROWS", "length": length}}])
     return {"sheetId": sheet_id, "dimension": "ROWS", "length": length}
 
@@ -1106,7 +1182,7 @@ def append_columns_to_sheet(spreadsheet_id: str, sheet: str, length: int) -> dic
     """Append empty columns to the end of a sheet."""
     if length <= 0:
         raise ValueError("length must be positive.")
-    sheet_id = client.resolve_sheet_id(_sid(spreadsheet_id), sheet)
+    sheet_id = current_client().resolve_sheet_id(_sid(spreadsheet_id), sheet)
     _execute_batch_update(spreadsheet_id, [{"appendDimension": {"sheetId": sheet_id, "dimension": "COLUMNS", "length": length}}])
     return {"sheetId": sheet_id, "dimension": "COLUMNS", "length": length}
 
@@ -1130,7 +1206,7 @@ def move_rows_or_columns(
 @mcp.tool()
 def insert_range(spreadsheet_id: str, range: str, shift_dimension: str = "ROWS") -> dict:
     """Insert cells in an A1 range, shifting existing cells by ROWS or COLUMNS."""
-    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    grid = current_client().resolve_grid_range(_sid(spreadsheet_id), range)
     shift = _dimension(shift_dimension)
     _execute_batch_update(spreadsheet_id, [{"insertRange": {"range": grid, "shiftDimension": shift}}])
     return {"range": range, "shiftDimension": shift}
@@ -1139,7 +1215,7 @@ def insert_range(spreadsheet_id: str, range: str, shift_dimension: str = "ROWS")
 @mcp.tool()
 def delete_range(spreadsheet_id: str, range: str, shift_dimension: str = "ROWS") -> dict:
     """Delete cells in an A1 range, shifting remaining cells by ROWS or COLUMNS."""
-    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    grid = current_client().resolve_grid_range(_sid(spreadsheet_id), range)
     shift = _dimension(shift_dimension)
     _execute_batch_update(spreadsheet_id, [{"deleteRange": {"range": grid, "shiftDimension": shift}}])
     return {"range": range, "shiftDimension": shift}
@@ -1154,6 +1230,7 @@ def copy_range(
     paste_orientation: str = "NORMAL",
 ) -> dict:
     """Copy a range to another range."""
+    client = current_client()
     sid = _sid(spreadsheet_id)
     req = {
         "copyPaste": {
@@ -1175,6 +1252,7 @@ def cut_paste_range(
     paste_type: str = "PASTE_NORMAL",
 ) -> dict:
     """Cut a range and paste it starting at a destination cell."""
+    client = current_client()
     sid = _sid(spreadsheet_id)
     req = {
         "cutPaste": {
@@ -1215,7 +1293,7 @@ def sort_range(spreadsheet_id: str, range: str, sort_specs: list[dict]) -> dict:
     """Sort a range using Sheets API ``SortSpec`` objects."""
     if not sort_specs:
         raise ValueError("Provide at least one sort spec.")
-    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    grid = current_client().resolve_grid_range(_sid(spreadsheet_id), range)
     _execute_batch_update(spreadsheet_id, [{"sortRange": {"range": grid, "sortSpecs": sort_specs}}])
     return {"range": range, "sortSpecs": sort_specs}
 
@@ -1242,7 +1320,7 @@ def find_replace(
         "includeFormulas": include_formulas,
     }
     if range:
-        body["range"] = client.resolve_grid_range(_sid(spreadsheet_id), range)
+        body["range"] = current_client().resolve_grid_range(_sid(spreadsheet_id), range)
     else:
         body["allSheets"] = all_sheets or True
     result = _execute_batch_update(spreadsheet_id, [{"findReplace": body}])
@@ -1253,7 +1331,7 @@ def find_replace(
 @mcp.tool()
 def trim_whitespace(spreadsheet_id: str, range: str) -> dict:
     """Trim leading/trailing/repeated whitespace in each cell in an A1 range."""
-    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    grid = current_client().resolve_grid_range(_sid(spreadsheet_id), range)
     result = _execute_batch_update(spreadsheet_id, [{"trimWhitespace": {"range": grid}}])
     reply = result.get("replies", [{}])[0].get("trimWhitespace", {})
     return {"range": range, "cellsChangedCount": reply.get("cellsChangedCount")}
@@ -1266,7 +1344,7 @@ def delete_duplicates(
     comparison_columns: list[int] | None = None,
 ) -> dict:
     """Remove duplicate rows from a range, optionally comparing only column indexes."""
-    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    grid = current_client().resolve_grid_range(_sid(spreadsheet_id), range)
     body: dict[str, Any] = {"range": grid}
     if comparison_columns:
         body["comparisonColumns"] = [
@@ -1292,7 +1370,7 @@ def text_to_columns(
 ) -> dict:
     """Split a single-column range into multiple columns."""
     body: dict[str, Any] = {
-        "source": client.resolve_grid_range(_sid(spreadsheet_id), source_range),
+        "source": current_client().resolve_grid_range(_sid(spreadsheet_id), source_range),
         "delimiterType": delimiter_type.upper(),
     }
     if delimiter is not None:
@@ -1308,7 +1386,7 @@ def auto_fill(
     use_alternate_series: bool = False,
 ) -> dict:
     """Autofill within an A1 range by detecting existing source data."""
-    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    grid = current_client().resolve_grid_range(_sid(spreadsheet_id), range)
     req = {
         "autoFill": {
             "range": grid,
@@ -1322,7 +1400,7 @@ def auto_fill(
 @mcp.tool()
 def randomize_range(spreadsheet_id: str, range: str) -> dict:
     """Randomize row order inside an A1 range."""
-    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    grid = current_client().resolve_grid_range(_sid(spreadsheet_id), range)
     _execute_batch_update(spreadsheet_id, [{"randomizeRange": {"range": grid}}])
     return {"range": range, "randomized": True}
 
@@ -1340,7 +1418,7 @@ def set_basic_filter(
     filter_specs: list[dict] | None = None,
 ) -> dict:
     """Set the sheet's basic filter over an A1 range."""
-    basic_filter: dict[str, Any] = {"range": client.resolve_grid_range(_sid(spreadsheet_id), range)}
+    basic_filter: dict[str, Any] = {"range": current_client().resolve_grid_range(_sid(spreadsheet_id), range)}
     if sort_specs:
         basic_filter["sortSpecs"] = sort_specs
     if filter_specs:
@@ -1352,7 +1430,7 @@ def set_basic_filter(
 @mcp.tool()
 def clear_basic_filter(spreadsheet_id: str, sheet: str) -> dict:
     """Clear the basic filter on a sheet."""
-    sheet_id = client.resolve_sheet_id(_sid(spreadsheet_id), sheet)
+    sheet_id = current_client().resolve_sheet_id(_sid(spreadsheet_id), sheet)
     _execute_batch_update(spreadsheet_id, [{"clearBasicFilter": {"sheetId": sheet_id}}])
     return {"sheetId": sheet_id, "cleared": True}
 
@@ -1366,7 +1444,7 @@ def add_filter_view(
     filter_specs: list[dict] | None = None,
 ) -> dict:
     """Add a filter view over an A1 range."""
-    filter_view: dict[str, Any] = {"range": client.resolve_grid_range(_sid(spreadsheet_id), range)}
+    filter_view: dict[str, Any] = {"range": current_client().resolve_grid_range(_sid(spreadsheet_id), range)}
     if title is not None:
         filter_view["title"] = title
     if sort_specs:
@@ -1417,7 +1495,7 @@ def set_data_validation(
         rule["inputMessage"] = input_message
     req = {
         "setDataValidation": {
-            "range": client.resolve_grid_range(_sid(spreadsheet_id), range),
+            "range": current_client().resolve_grid_range(_sid(spreadsheet_id), range),
             "rule": rule,
             "filteredRowsIncluded": filtered_rows_included,
         }
@@ -1429,7 +1507,7 @@ def set_data_validation(
 @mcp.tool()
 def clear_data_validation(spreadsheet_id: str, range: str) -> dict:
     """Clear data validation from an A1 range."""
-    req = {"setDataValidation": {"range": client.resolve_grid_range(_sid(spreadsheet_id), range)}}
+    req = {"setDataValidation": {"range": current_client().resolve_grid_range(_sid(spreadsheet_id), range)}}
     _execute_batch_update(spreadsheet_id, [req])
     return {"range": range, "cleared": True}
 
@@ -1442,7 +1520,7 @@ def clear_data_validation(spreadsheet_id: str, range: str) -> dict:
 @mcp.tool()
 def add_named_range(spreadsheet_id: str, name: str, range: str) -> dict:
     """Create a named range over an A1 range."""
-    named_range = {"name": name, "range": client.resolve_grid_range(_sid(spreadsheet_id), range)}
+    named_range = {"name": name, "range": current_client().resolve_grid_range(_sid(spreadsheet_id), range)}
     result = _execute_batch_update(spreadsheet_id, [{"addNamedRange": {"namedRange": named_range}}])
     added = result.get("replies", [{}])[0].get("addNamedRange", {}).get("namedRange", {})
     return {"namedRangeId": added.get("namedRangeId"), "name": added.get("name", name)}
@@ -1462,7 +1540,7 @@ def update_named_range(
         named_range["name"] = name
         fields.append("name")
     if range is not None:
-        named_range["range"] = client.resolve_grid_range(_sid(spreadsheet_id), range)
+        named_range["range"] = current_client().resolve_grid_range(_sid(spreadsheet_id), range)
         fields.append("range")
     if not fields:
         raise ValueError("Provide name and/or range.")
@@ -1488,7 +1566,7 @@ def add_protected_range(
 ) -> dict:
     """Protect an A1 range; defaults to warning-only protection."""
     protected_range: dict[str, Any] = {
-        "range": client.resolve_grid_range(_sid(spreadsheet_id), range),
+        "range": current_client().resolve_grid_range(_sid(spreadsheet_id), range),
         "warningOnly": warning_only,
     }
     if description is not None:
@@ -1527,7 +1605,7 @@ def add_banding(
     column_properties: dict | None = None,
 ) -> dict:
     """Add alternating-color banding to an A1 range."""
-    banded_range: dict[str, Any] = {"range": client.resolve_grid_range(_sid(spreadsheet_id), range)}
+    banded_range: dict[str, Any] = {"range": current_client().resolve_grid_range(_sid(spreadsheet_id), range)}
     if row_properties is not None:
         banded_range["rowProperties"] = row_properties
     if column_properties is not None:
@@ -1613,7 +1691,7 @@ def add_table(
     rows_properties: dict | None = None,
 ) -> dict:
     """Add a Sheets table over an A1 range."""
-    table: dict[str, Any] = {"range": client.resolve_grid_range(_sid(spreadsheet_id), range)}
+    table: dict[str, Any] = {"range": current_client().resolve_grid_range(_sid(spreadsheet_id), range)}
     if name is not None:
         table["name"] = name
     if column_properties:
@@ -1676,6 +1754,7 @@ def create_chart(
     ``sheet``. ``anchor_cell`` is where the chart is overlaid on that sheet.
     """
     sid = _sid(spreadsheet_id)
+    client = current_client()
     position_sheet_id = client.resolve_sheet_id(sid, sheet)
 
     domain_grid = client.resolve_grid_range(sid, domain_range, default_sheet=sheet)
@@ -1832,7 +1911,7 @@ def create_pivot_table(
     PivotGroup/PivotValue/PivotFilterSpec shapes.
     """
     pivot_table: dict[str, Any] = {
-        "source": client.resolve_grid_range(_sid(spreadsheet_id), source_range),
+        "source": current_client().resolve_grid_range(_sid(spreadsheet_id), source_range),
         "valueLayout": value_layout.upper(),
     }
     if rows:
@@ -1869,7 +1948,7 @@ def add_slicer(
 ) -> dict:
     """Add a slicer for a data range."""
     spec: dict[str, Any] = {
-        "dataRange": client.resolve_grid_range(_sid(spreadsheet_id), data_range, default_sheet=sheet),
+        "dataRange": current_client().resolve_grid_range(_sid(spreadsheet_id), data_range, default_sheet=sheet),
         "columnIndex": column_index,
     }
     if title is not None:
@@ -1930,7 +2009,7 @@ def add_conditional_format(
     ``CUSTOM_FORMULA`` a single ``["=$A1>5"]``). The format applies when the
     condition is true.
     """
-    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    grid = current_client().resolve_grid_range(_sid(spreadsheet_id), range)
 
     fmt: dict[str, Any] = {}
     if background_color is not None:
@@ -1968,7 +2047,7 @@ def add_conditional_format(
             "index": 0,
         }
     }
-    client.batch_update(spreadsheet_id, [req])
+    current_client().batch_update(spreadsheet_id, [req])
     return {"range": range, "conditionType": condition_type.upper()}
 
 
@@ -1986,7 +2065,7 @@ def update_conditional_format(
     new_index: int | None = None,
 ) -> dict:
     """Replace a conditional-format rule at ``index``."""
-    grid = client.resolve_grid_range(_sid(spreadsheet_id), range)
+    grid = current_client().resolve_grid_range(_sid(spreadsheet_id), range)
     fmt: dict[str, Any] = {}
     if background_color is not None:
         fmt["backgroundColor"] = parse_color(background_color)
@@ -2006,7 +2085,7 @@ def update_conditional_format(
             "booleanRule": {"condition": _condition(condition_type, values), "format": fmt},
         },
         "index": index,
-        "sheetId": client.resolve_sheet_id(_sid(spreadsheet_id), sheet),
+        "sheetId": current_client().resolve_sheet_id(_sid(spreadsheet_id), sheet),
     }
     if new_index is not None:
         body["newIndex"] = new_index
@@ -2019,15 +2098,31 @@ def delete_conditional_format(spreadsheet_id: str, sheet: str, index: int) -> di
     """Delete a conditional-format rule by sheet and index."""
     body: dict[str, Any] = {
         "index": index,
-        "sheetId": client.resolve_sheet_id(_sid(spreadsheet_id), sheet),
+        "sheetId": current_client().resolve_sheet_id(_sid(spreadsheet_id), sheet),
     }
     _execute_batch_update(spreadsheet_id, [{"deleteConditionalFormatRule": body}])
     return {"index": index, "sheet": sheet, "deleted": True}
 
 
+# Register the natural-interaction layer (composite tools + prompts) on top of
+# the low-level tools above. Done here, at the bottom, so these modules can
+# import server helpers without a circular import.
+from .highlevel import register_highlevel  # noqa: E402
+from .prompts import register_prompts  # noqa: E402
+
+register_highlevel(mcp)
+register_prompts(mcp)
+
+
 def main() -> None:
-    """Entry point — run the MCP server over stdio."""
-    mcp.run()
+    """Entry point — run the MCP server.
+
+    local mode: stdio. group mode: Streamable HTTP (configured in _build_mcp).
+    """
+    if _mode() == "group":
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":

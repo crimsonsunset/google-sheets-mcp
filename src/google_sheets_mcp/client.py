@@ -1,7 +1,10 @@
 """Thin wrapper around the Google Sheets API v4 service.
 
-Holds the lazily-built service object, resolves sheet names to ``sheetId``s, and
-turns A1 ranges into fully-qualified ``GridRange`` objects for formatting calls.
+A ``SheetsClient`` is bound to one set of credentials. In local mode a single
+instance is reused; in group mode one is built per request from the caller's
+own Google access token. Per-request construction is cheap because the client
+library ships a *static* Sheets v4 discovery document, so ``build`` reads it
+from disk with no network round-trip.
 """
 
 from __future__ import annotations
@@ -13,17 +16,22 @@ from .auth import get_credentials
 
 
 class SheetsClient:
-    def __init__(self) -> None:
+    def __init__(self, credentials=None) -> None:
+        """Bind to ``credentials``; if None, fall back to local on-disk creds."""
+        self._credentials = credentials
         self._service = None
 
     @property
     def service(self):
         if self._service is None:
+            creds = self._credentials or get_credentials()
+            # static_discovery=True uses the bundled sheets.v4.json (no network).
             self._service = build(
                 "sheets",
                 "v4",
-                credentials=get_credentials(),
+                credentials=creds,
                 cache_discovery=False,
+                static_discovery=True,
             )
         return self._service
 
@@ -74,8 +82,13 @@ class SheetsClient:
             if p["title"] == sheet:
                 return p["sheetId"]
 
-        available = ", ".join(repr(p["title"]) for p in props)
-        raise ValueError(f"Sheet {sheet!r} not found. Available sheets: {available}.")
+        titles = [p["title"] for p in props]
+        available = ", ".join(repr(t) for t in titles)
+        import difflib
+
+        close = difflib.get_close_matches(str(sheet), titles, n=1, cutoff=0.6)
+        hint = f" Did you mean {close[0]!r}?" if close else ""
+        raise ValueError(f"Sheet {sheet!r} not found.{hint} Available sheets: {available}.")
 
     def resolve_grid_range(
         self,

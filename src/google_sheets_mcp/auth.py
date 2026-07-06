@@ -24,6 +24,17 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
+def credentials_from_access_token(access_token: str) -> Credentials:
+    """Build read-only-lifecycle credentials from a bare Google access token.
+
+    Used in group (hosted) mode: each request carries the caller's own Google
+    access token, which we wrap into a ``Credentials`` for a single API call.
+    There is no refresh token here — the token is short-lived and discarded
+    after the request; refresh happens out-of-band via the OAuth bridge.
+    """
+    return Credentials(token=access_token, scopes=SCOPES)
+
+
 def config_dir() -> Path:
     base = os.environ.get("GOOGLE_SHEETS_MCP_HOME")
     path = Path(base).expanduser() if base else Path.home() / ".config" / "google-sheets-mcp"

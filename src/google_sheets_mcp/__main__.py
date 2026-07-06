@@ -1,19 +1,42 @@
 """CLI entry point.
 
 Usage:
-  google-sheets-mcp           Run the MCP server over stdio (default).
-  google-sheets-mcp auth      Run the OAuth flow once and cache the token.
+  google-sheets-mcp                  Run the server (mode from $GSHEETS_MCP_MODE,
+                                     default: local stdio).
+  google-sheets-mcp serve [--mode local|group]
+                                     Run the server, optionally forcing the mode.
+  google-sheets-mcp auth             (local) Run the OAuth flow once and cache the token.
+  google-sheets-mcp genkey           Print a fresh Fernet wrap key for group mode.
 """
 
 from __future__ import annotations
 
+import os
 import sys
+
+
+def _run_server() -> None:
+    # server reads the mode at import time, so $GSHEETS_MCP_MODE must be set first.
+    from .server import main as run_server
+
+    run_server()
 
 
 def main() -> None:
     args = sys.argv[1:]
+    cmd = args[0] if args else None
 
-    if args and args[0] == "auth":
+    if cmd in {"-h", "--help", "help"}:
+        print(__doc__)
+        return
+
+    if cmd == "genkey":
+        from cryptography.fernet import Fernet
+
+        print(Fernet.generate_key().decode())
+        return
+
+    if cmd == "auth":
         from .auth import config_dir, get_credentials
 
         try:
@@ -21,16 +44,30 @@ def main() -> None:
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             raise SystemExit(1)
-        print("Authenticated. Token cached in the config directory.")
+        print(f"Authenticated. Token cached under {config_dir()}.")
         return
 
-    if args and args[0] in {"-h", "--help", "help"}:
-        print(__doc__)
+    if cmd == "serve":
+        if "--mode" in args:
+            i = args.index("--mode")
+            try:
+                requested = args[i + 1]
+            except IndexError:
+                print("Error: --mode needs a value (local|group)", file=sys.stderr)
+                raise SystemExit(1)
+            if requested not in {"local", "group"}:
+                print("Error: --mode must be 'local' or 'group'", file=sys.stderr)
+                raise SystemExit(1)
+            os.environ["GSHEETS_MCP_MODE"] = requested
+        _run_server()
         return
 
-    from .server import main as run_server
+    if cmd is not None:
+        print(f"Unknown command: {cmd!r}\n", file=sys.stderr)
+        print(__doc__, file=sys.stderr)
+        raise SystemExit(1)
 
-    run_server()
+    _run_server()
 
 
 if __name__ == "__main__":
