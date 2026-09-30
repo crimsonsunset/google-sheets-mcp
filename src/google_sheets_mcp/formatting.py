@@ -13,7 +13,10 @@ from .refs import quote_sheet
 # Ceiling is MAX_CELLS. Upgrade path is paging the grid and emitting row-runs.
 MAX_CELLS = 2500
 
+DEFAULT_FONT_SIZE = 10
+
 FORMAT_FIELDS = (
+    "properties.defaultFormat.textFormat.fontSize,"
     "sheets(properties.title,data(startRow,startColumn,"
     "rowData(values(effectiveFormat(backgroundColor,backgroundColorStyle,"
     "textFormat(foregroundColor,foregroundColorStyle,bold,italic,underline,"
@@ -52,24 +55,24 @@ def _color_value(rgb: dict | None, style: dict | None) -> str | None:
     return None
 
 
-def style_from_cell(cell: dict) -> dict:
+def style_from_cell(cell: dict, default_font_size: int = DEFAULT_FONT_SIZE) -> dict:
     """Pick the formatting worth reporting from one grid cell.
 
-    White backgrounds, black text, and the default 10pt font are omitted.
-    What remains is what a reader would notice: color, emphasis, a number
-    format, or a cell note. Colors come from the effective format, so
-    conditional formatting is included.
+    White backgrounds, black text, theme default colors, and the spreadsheet's
+    default font size are omitted. What remains is what a reader would notice:
+    color, emphasis, a number format, or a cell note. Colors come from the
+    effective format, so conditional formatting is included.
     """
     fmt = cell.get("effectiveFormat") or {}
     text = fmt.get("textFormat") or {}
     style: dict = {}
 
     background = _color_value(fmt.get("backgroundColor"), fmt.get("backgroundColorStyle"))
-    if background and background.lower() != "#ffffff":
+    if background and background.lower() not in ("#ffffff", "background"):
         style["backgroundColor"] = background
 
     foreground = _color_value(text.get("foregroundColor"), text.get("foregroundColorStyle"))
-    if foreground and foreground.lower() != "#000000":
+    if foreground and foreground.lower() not in ("#000000", "text"):
         style["textColor"] = foreground
 
     for flag in ("bold", "italic", "underline", "strikethrough"):
@@ -77,7 +80,7 @@ def style_from_cell(cell: dict) -> dict:
             style[flag] = True
 
     font_size = text.get("fontSize")
-    if font_size is not None and font_size != 10:
+    if font_size is not None and font_size != default_font_size:
         style["fontSize"] = font_size
 
     number_format = fmt.get("numberFormat") or {}
@@ -154,7 +157,13 @@ def collapse_runs(cells: list[tuple[int, int, dict]], sheet_title: str | None) -
 
 
 def runs_from_grid(response: dict, include_defaults: bool = False) -> list[dict]:
-    """Build collapsed runs from a ``spreadsheets.get`` grid-data response."""
+    """Build collapsed runs from a ``spreadsheets.get`` grid-data response.
+
+    The spreadsheet's own default font size is the baseline, so a sheet set to
+    11pt does not report every cell as 11pt.
+    """
+    default_format = response.get("properties", {}).get("defaultFormat", {})
+    default_font_size = default_format.get("textFormat", {}).get("fontSize", DEFAULT_FONT_SIZE)
     runs: list[dict] = []
     for sheet in response.get("sheets", []):
         title = sheet.get("properties", {}).get("title")
@@ -164,7 +173,7 @@ def runs_from_grid(response: dict, include_defaults: bool = False) -> list[dict]
             start_col = block.get("startColumn", 0)
             for row_offset, row in enumerate(block.get("rowData", [])):
                 for col_offset, cell in enumerate(row.get("values", [])):
-                    style = style_from_cell(cell)
+                    style = style_from_cell(cell, default_font_size)
                     if style or include_defaults:
                         cells.append((start_row + row_offset, start_col + col_offset, style))
         runs.extend(collapse_runs(cells, title))

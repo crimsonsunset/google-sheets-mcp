@@ -115,3 +115,19 @@ def test_open_range_rejected():
 def test_oversized_range_rejected():
     with pytest.raises(ValueError):
         assert_bounded_range("Inputs!A1:Z200")
+
+
+def test_sheet_defaults_are_not_reported():
+    plain = {
+        "effectiveFormat": {
+            "textFormat": {"foregroundColorStyle": {"themeColor": "TEXT"}, "fontSize": 11},
+            "backgroundColorStyle": {"themeColor": "BACKGROUND"},
+        }
+    }
+    bold = {"effectiveFormat": {"textFormat": {"bold": True, "fontSize": 11}}}
+    response = {
+        "properties": {"defaultFormat": {"textFormat": {"fontSize": 11}}},
+        "sheets": [{"properties": {"title": "Budget"}, "data": [{"rowData": [{"values": [plain, bold]}]}]}],
+    }
+    runs = runs_from_grid(response)
+    assert runs == [{"range": "Budget!B1", "bold": True}]
